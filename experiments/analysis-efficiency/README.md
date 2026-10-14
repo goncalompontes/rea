@@ -19,6 +19,10 @@ Follow-up: [SQLite existing-control measurements](sqlite-existing-controls.md)
 tests QGIS's shipped GeoPackage through the existing column selection, preserving
 full selected-table schema and typed cells before considering another API.
 
+Follow-up: [small real PCAP recordings](pcap-small-captures.md) compares existing
+complete delivery with summary/pages. Preserve the negative SDK/model input
+results: compact captures do not justify another production mechanism.
+
 Follow-up: [native PE/DOS entry views and real model verification](native-entry-views.md)
 records the post-merge native continuation, including a small-function case where
 four selected replies cost more bytes than the complete dossier.
@@ -67,6 +71,18 @@ private lab. These local files are not required to build or use REA. Historical
 checkpoint commits retain their original receipts; no history was rewritten.
 
 ## Optimization priorities and gradual migration
+
+The [larger/non-HTTP packet checkpoint](packet-field-workflows.md) records
+same-question SDK and actual Codex comparisons using existing input limits,
+field/filter selection, discovery and output windows. Lower delivered JSON did
+not establish stable total-token or speed gains; failed plans and negative
+controls remain visible.
+
+The [sigrok selection checkpoint](signal-selection-workflows.md) records two
+real hardware recordings, independently verified bytes, repeated decoder/pages,
+and an eight-task Codex cohort with mixed token/time results. Existing annotation
+controls reduce replies; these measurements introduce no production cache,
+default or API changes.
 
 Agent token consumption and end-to-end task time are the primary objectives.
 Memory and CPU consumption are also measured and controlled. Correctness,

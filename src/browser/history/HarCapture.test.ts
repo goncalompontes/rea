@@ -257,6 +257,39 @@ it.each(["9007199254740993", "4740993", "99"])(
   },
 );
 
+it.each([
+  { encoded: "1e3", sensitive: "1000" },
+  { encoded: "123.4500", sensitive: "123.45" },
+  { encoded: "0.0000001", sensitive: "1e-7" },
+])(
+  "excludes sensitive numbers introduced by JSON normalization: $encoded",
+  ({ encoded, sensitive }) => {
+    const text = JSON.stringify(historicalHar())
+      .replace('"log":{', `"_number":${encoded},"log":{`)
+      .replace('"cache":{}', `"cache":{},"_number":${encoded}`);
+    const result = decodeHarCapture(text, [sensitive]);
+    for (const projection of [result.container, ...result.records]) {
+      expect(projection.reported).toMatchObject({ _number: null });
+      expect(projection.numeric_literals).not.toContainEqual(
+        expect.objectContaining({ pointer: "/_number" }),
+      );
+      expect(projection.redactions).toContainEqual({
+        pointer: "/_number",
+        reason: "explicit-sensitive-value",
+      });
+    }
+    const unmarked = decodeHarCapture(text, []);
+    for (const projection of [unmarked.container, ...unmarked.records]) {
+      expect(projection.reported).toMatchObject({ _number: Number(encoded) });
+      expect(projection.numeric_literals).toContainEqual({
+        pointer: "/_number",
+        producer_type: "json-number",
+        literal: encoded,
+      });
+    }
+  },
+);
+
 it("keeps unsafe extension numeric lexemes and rejects unsafe mandatory schema numbers", () => {
   const text = JSON.stringify(historicalHar());
   const result = decodeHarCapture(
@@ -446,6 +479,71 @@ it("preserves observed SaveHar null post-data without broadening arbitrary HAR p
     ),
   ).toThrow("HAR schema validation failed");
 });
+
+it.each(["[2001:db8::1]", "[::1]", "[::ffff:192.0.2.1]"])(
+  "retains Playwright 1.58.2 bracketed IPv6 spelling in reported Evidence: %s",
+  (address) => {
+    const fixture = historicalHar();
+    const first = fixture.log.entries[0];
+    if (first === undefined) throw new Error("fixture missing");
+    const input = {
+      log: {
+        ...fixture.log,
+        creator: { name: "Playwright", version: "1.58.2" },
+        entries: [
+          {
+            ...first,
+            serverIPAddress: address,
+            _extension: { serverIPAddress: address },
+          },
+          structuredClone(first),
+        ],
+      },
+    };
+    const decoded = decodeHarCapture(JSON.stringify(input), []);
+    expect(decoded.records[0]).toMatchObject({
+      reported: {
+        serverIPAddress: address,
+        _extension: { serverIPAddress: address },
+      },
+    });
+    expect(decoded.records[0]?.limitations).toContain(
+      "This capture declares Playwright 1.58.2 and reports bracketed IPv6 serverIPAddress. Original spellings are retained; brackets were removed only from valid IPv6 values in the validation copy. Producer declarations are not authenticated.",
+    );
+    expect(
+      decoded.records[1]?.limitations.some((limitation) =>
+        limitation.includes("bracketed IPv6 serverIPAddress"),
+      ),
+    ).toBe(false);
+  },
+);
+
+it.each([
+  { name: "other", version: "1.58.2", address: "[2001:db8::1]" },
+  { name: "Playwright", version: "1.58.1", address: "[2001:db8::1]" },
+  { name: "Playwright", version: "1.58.2", address: "[192.0.2.1]" },
+  { name: "Playwright", version: "1.58.2", address: "[2001:db8::1]:443" },
+  { name: "Playwright", version: "1.58.2", address: "[fe80::1%eth0]" },
+])(
+  "rejects unrecognized bracketed HAR address input: $name $version $address",
+  ({ name, version, address }) => {
+    const fixture = historicalHar();
+    const first = fixture.log.entries[0];
+    if (first === undefined) throw new Error("fixture missing");
+    expect(() =>
+      decodeHarCapture(
+        JSON.stringify({
+          log: {
+            ...fixture.log,
+            creator: { name, version },
+            entries: [{ ...first, serverIPAddress: address }],
+          },
+        }),
+        [],
+      ),
+    ).toThrow("HAR schema validation failed");
+  },
+);
 
 it.each([
   "c2VjcmV0",

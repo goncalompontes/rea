@@ -18,6 +18,7 @@ import { projectAnalysisError } from "./domain/analysisErrorProjection.js";
 import { PRODUCT_IDENTITY } from "./identity.js";
 import { npxRegistrationCommand } from "./application/ClientRegistrationIdentity.js";
 import { registerSetupCommands } from "./cli/setupCommands.js";
+import { registerCacheCommands } from "./cli/cacheCommands.js";
 import { registerCoreAnalysisCommands } from "./cli/coreAnalysisCommands.js";
 import { registerUtilityCommands } from "./cli/utilityCommands.js";
 import { registerArtifactCommands } from "./cli/artifactCommands.js";
@@ -49,6 +50,8 @@ import {
   streamCliCommandResults,
   type CliResultOutput,
 } from "./cli/cliResultOutput.js";
+import { registerReverseEngineeringCommands } from "./cli/reverseEngineeringCommands.js";
+import { registerCutterCommands } from "./cli/cutterCommands.js";
 
 /** Describe CLI settings that are invalid before any command runs, as MCP does. */
 export const cliConfigurationError = (
@@ -95,6 +98,9 @@ export const createCli = (
   });
 
   registerSetupCommands(cli, logger, environment);
+  registerReverseEngineeringCommands(cli, logger, environment);
+  registerCutterCommands(cli, logger, environment);
+  registerCacheCommands(cli, logger, environment);
   registerCoreAnalysisCommands(cli, logger, analysis.runDirectAnalysis);
   registerUtilityCommands(cli, logger, environment, analysis);
   registerWasmCommands(cli, logger, environment);

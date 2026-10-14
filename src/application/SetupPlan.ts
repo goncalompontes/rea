@@ -1,12 +1,11 @@
-import { join } from "node:path";
-
-import { isOwnedClientRegistrationCommand } from "./ClientRegistrationIdentity.js";
+import { classifyClientRegistrationCommand } from "./ClientRegistrationIdentity.js";
 import {
   linuxHopperInstallDisclosure,
   type LinuxPackageFamily,
 } from "./LinuxHopper.js";
 import type { SkillDestination } from "./SetupSkill.js";
 import { macHopperInstallDisclosure } from "./MacHopper.js";
+import { macHopperUserApplicationPath } from "./MacHopperPaths.js";
 import type {
   ClientConfigurationInspection,
   SetupAction,
@@ -22,6 +21,7 @@ import {
 import { redirectedWriteBlocker } from "./MsixPackageStorage.js";
 import type { DoctorReport } from "./Doctor.js";
 import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
+import { CURRENT_ENTRYPOINT_PATH } from "../process/CurrentEntrypointPath.js";
 
 /** Read-only setup facts shared by client selection and preflight. */
 export interface SetupDiscovery {
@@ -39,16 +39,19 @@ export const discoverSetupState = async (input: {
   readonly host: SetupHost;
   readonly providerEnvironment: SetupProviderEnvironment;
   readonly forceHopperInstall: boolean;
+  readonly hopperLauncherConfigured?: boolean;
   readonly proposeHopper: boolean;
   readonly initialDoctor: DoctorReport;
 }): Promise<SetupDiscovery> => {
   const { initialDoctor } = input;
-  const linuxHopperRepairNeeded = initialDoctor.checks.some(
-    ({ name, ok, detail }) =>
-      !ok &&
-      (name === "hopper-demo-runtime" ||
-        (name === "hopper-version" && detail === "/opt/hopper/bin/Hopper")),
-  );
+  const linuxHopperRepairNeeded =
+    input.hopperLauncherConfigured !== true &&
+    initialDoctor.checks.some(
+      ({ name, ok, detail }) =>
+        !ok &&
+        (name === "hopper-demo-runtime" ||
+          (name === "hopper-version" && detail === "/opt/hopper/bin/Hopper")),
+    );
   const linuxDistribution =
     input.host.platform === "linux"
       ? await input.host.linuxDistribution()
@@ -75,20 +78,29 @@ export const discoverSetupState = async (input: {
   );
   const clientStates = clients.map((client): SetupClientState => {
     const registration = registrationByClient.get(client.name);
+    const commandIdentity =
+      registration === undefined
+        ? undefined
+        : classifyClientRegistrationCommand(
+            registration.command,
+            CURRENT_ENTRYPOINT_PATH,
+          );
     const ownedRegistration =
       (registration?.state === "aligned" || registration?.state === "stale") &&
-      isOwnedClientRegistrationCommand(registration.command);
+      commandIdentity === "owned";
     const configured = ownedRegistration;
     const status: SetupClientState["status"] =
       registration?.state === "invalid"
         ? "invalid"
-        : ownedRegistration && registration.state === "aligned"
-          ? "configured"
-          : ownedRegistration && registration.state === "stale"
-            ? "needs_configuration"
-            : detectedIds.has(client.name)
+        : registration?.state === "unknown" || commandIdentity === "unknown"
+          ? "unknown"
+          : ownedRegistration && registration.state === "aligned"
+            ? "configured"
+            : ownedRegistration && registration.state === "stale"
               ? "needs_configuration"
-              : "missing";
+              : detectedIds.has(client.name)
+                ? "needs_configuration"
+                : "missing";
     return {
       client,
       detected: detectedIds.has(client.name),
@@ -100,7 +112,10 @@ export const discoverSetupState = async (input: {
     .filter(
       (registration) =>
         (registration.state === "aligned" || registration.state === "stale") &&
-        isOwnedClientRegistrationCommand(registration.command),
+        classifyClientRegistrationCommand(
+          registration.command,
+          CURRENT_ENTRYPOINT_PATH,
+        ) === "owned",
     )
     .map(({ client }) => client);
   return {
@@ -147,6 +162,16 @@ export const planSetupActions = async (input: {
     const client = byId.get(id);
     return client === undefined ? [] : [client];
   });
+  if (
+    selectedClients.length > 0 &&
+    input.host.registrationCommandBlocker !== undefined
+  )
+    return {
+      plannedActions: [],
+      selectedClients,
+      clientsToConfigure: [],
+      blocker: input.host.registrationCommandBlocker,
+    };
   const inspections = await Promise.all(
     selectedClients.map(async (client) => ({
       client,
@@ -261,10 +286,7 @@ const setupPlan = (input: {
           label: "Hopper deep-analysis provider",
           target:
             input.platform === "darwin"
-              ? join(
-                  input.homeDirectory,
-                  "Applications/Hopper Disassembler.app",
-                )
+              ? macHopperUserApplicationPath(input.homeDirectory)
               : "system package manager",
           detail:
             input.platform === "linux"

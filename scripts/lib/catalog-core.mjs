@@ -43,6 +43,16 @@ const SOURCE_PATHS = {
   sessionContracts: "dist/contracts/sessionToolContracts.js",
   binaryDiagnosticsContracts:
     "dist/contracts/native/binaryDiagnosticsToolContracts.js",
+  cutterContracts: "dist/contracts/cutterToolContracts.js",
+  cutterProvider: "dist/cutter/CutterBridgeClient.js",
+  reverseEngineeringContracts:
+    "dist/contracts/reverseEngineeringToolContracts.js",
+  gdbContracts: "dist/contracts/gdbToolContracts.js",
+  gdbProvider: "dist/gdb/GdbSessionManager.js",
+  rizinDebugContracts: "dist/contracts/rizinDebugToolContracts.js",
+  objdumpProvider: "dist/objdump/ObjdumpCommand.js",
+  rizinProvider: "dist/rizin/RizinCommand.js",
+  rizinDebugProvider: "dist/rizin/RizinDebugSessionManager.js",
   fridaContracts: "dist/contracts/fridaToolContracts.js",
   fridaProvider: "dist/frida/FridaInstrumentationManager.js",
   pwntoolsProvider: "dist/native/pwntools/PwntoolsRelease.js",
@@ -86,6 +96,7 @@ const SOURCE_PATHS = {
   webNetworkCaptureProvider: "dist/browser/history/CaptureRelease.js",
   browserScenarioContracts: "dist/contracts/browserScenarioToolContracts.js",
   electronContracts: "dist/contracts/javascript/electronToolContracts.js",
+  electronFuseProvider: "dist/electron/ElectronFuseProvider.js",
   javascriptRuntimeObservationContracts:
     "dist/contracts/javascript/javascriptRuntimeObservationToolContracts.js",
   applicationContracts: "dist/contracts/applicationToolContracts.js",

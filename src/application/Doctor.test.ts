@@ -330,7 +330,7 @@ describe("doctor scoped readiness", () => {
         client: "cursor",
         config_path: "/home/user/.cursor/mcp.json",
         command: ["/old/rea", "mcp"],
-        state: "stale",
+        state: "unknown",
         remediation: "Run rea setup to refresh this registration.",
       },
     ];
@@ -349,7 +349,11 @@ describe("doctor scoped readiness", () => {
       expect.objectContaining({ name: "registration:codex", ok: true }),
     );
     expect(scoped.informational_checks).toContainEqual(
-      expect.objectContaining({ name: "registration:cursor", ok: false }),
+      expect.objectContaining({
+        name: "registration:cursor",
+        ok: false,
+        classification: "unknown",
+      }),
     );
 
     const staleSelected = await runDoctor(
@@ -588,6 +592,31 @@ describe("doctor Linux and Hopper discovery", () => {
       result.checks.find(({ name }) => name === "hopper-version")?.remediation,
     ).toContain("Unset or update HOPPER_LAUNCHER_PATH");
   });
+});
+
+describe("doctor installed Hopper discovery", () => {
+  it("checks the canonical user install after the system launcher", async () => {
+    const userPath =
+      "/fixture/home/Applications/Hopper Disassembler.app/Contents/MacOS/hopper";
+    const checked: string[] = [];
+    const result = await runDoctor(
+      undefined,
+      host({
+        homeDirectory: "/fixture/home",
+        executable: (candidate) => {
+          checked.push(candidate);
+          return Promise.resolve(candidate === userPath);
+        },
+      }),
+    );
+
+    expect(result.hopperPath).toBe(userPath);
+    expect(checked.slice(0, 2)).toEqual([
+      "/Applications/Hopper Disassembler.app/Contents/MacOS/hopper",
+      userPath,
+    ]);
+  });
+
   it("detects a Homebrew cask installed outside /Applications", async () => {
     const path =
       "/opt/homebrew/Caskroom/hopper/Hopper Disassembler.app/Contents/MacOS/hopper";
@@ -612,7 +641,9 @@ describe("doctor Linux and Hopper discovery", () => {
     );
     expect(result.hopperPath).toBe(path);
   });
+});
 
+describe("doctor target admission on Linux", () => {
   it("uses shared app target validation when a target is supplied", async () => {
     const result = await runDoctor(
       "/Applications/Notes.app",
@@ -650,6 +681,30 @@ describe("doctor Linux and Hopper discovery", () => {
       }),
     );
   });
+});
+
+describe("doctor standard Linux Hopper paths", () => {
+  it.each(["/opt/hopper-v4/bin/hopper", "/usr/bin/hopper"])(
+    "detects Hopper at the standard path %s",
+    async (path) => {
+      const result = await runDoctor(
+        undefined,
+        host({
+          platform: "linux",
+          macosVersion: () => Promise.resolve(undefined),
+          linuxDistribution: () =>
+            Promise.resolve({
+              id: "ubuntu",
+              versionId: "24.04",
+              packageFamily: "deb",
+              hopperSetupSupported: true,
+            }),
+          executable: (candidate) => Promise.resolve(candidate === path),
+        }),
+      );
+      expect(result.hopperPath).toBe(path);
+    },
+  );
 });
 
 describe("doctor target admission diagnostics", () => {

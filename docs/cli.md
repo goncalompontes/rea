@@ -152,9 +152,13 @@ overrides it. In MCP, pass `provider_id` to `open_binary`:
 The selected provider remains bound to the session until an explicit switch
 or close. Provider failures are returned with their original reason. For an
 `ambiguous` selection error, choose from `details.candidate_ids`; for
-`provider_unavailable`, run `rea doctor --provider ID --json` to diagnose the
-selected engine. See [task readiness](installation.md#check-readiness-for-your-task)
-and [provider selection](mcp-contracts.md#identity-and-discovery).
+`provider_unavailable`, follow `message`, `remediation.action`, and the original
+reasons in `details.rejections`. For Hopper, Ghidra, IDA, and JADX, run
+`rea doctor --provider ID --json` to diagnose the selected engine. Other adapters,
+such as `pwntools-elf`, report their configuration requirements directly and are
+not accepted by `doctor --provider`. See
+[task readiness](installation.md#check-readiness-for-your-task) and
+[provider selection](mcp-contracts.md#identity-and-discovery).
 
 The session reports work still in progress through `analysis_activity`.
 A client timeout can end its wait while the provider continues analyzing.
@@ -263,7 +267,12 @@ tree matches that commit remains unknown. It honors the source tree's `.gitignor
 and applies default exclusions for common generated and dependency paths such
 as `node_modules/`, `dist/`, and `*.log`. Pattern-based exclusions record the
 matched pattern and whether it came from project, default, caller, or sensitive
-path policy. Set `REA_REFERENCE_SECRET_PATTERNS_JSON` to a JSON array of ignore
+path policy. Links into excluded paths retain their internal target metadata;
+the exclusion explains why the target has no inventory entry, and the inventory
+remains partial. Exclusions record `entry_kind` when the importer observed it;
+older saved exclusions without that field have unknown kind. An excluded
+ancestor proves an internal descendant only when its kind is `directory`.
+Set `REA_REFERENCE_SECRET_PATTERNS_JSON` to a JSON array of ignore
 patterns when you want to mark selected paths as sensitive; those patterns are
 reported separately as configured-secret exclusions.
 
@@ -287,6 +296,7 @@ Choose the guide for the target and intended interaction:
 - [Browser observation](browser-observation.md): inspect a selected page through CDP.
 - [Browser scenarios](browser-scenario-contract.md): run declared interactions and capture their results.
 - [Electron observation](electron-observation.md): inspect an Electron renderer or capture an application scenario.
+- [Electron fuses](electron-fuses.md): read packaged fuse bytes before expecting `--inspect` to reach an Electron main process.
 - [Node/Electron Inspector](javascript-runtime-observation.md): record script locations and execution contexts.
 - [Process capture](process-capture.md): run an executable and compare terminal, exit and filesystem observations.
 
@@ -294,6 +304,14 @@ Runtime requests name the target and actions. Launched targets run with your
 user permissions; consult the chosen guide for host requirements and effects.
 
 ## Output and exit status
+
+`rea mcp doctor --json` checks production MCP startup and reports child logs in
+`diagnostics`. It drains stderr while retaining at most its first 64 KiB of raw
+bytes as text, omitting a final UTF-8 code point if it crosses that byte limit.
+`stderr_bytes` counts all observed bytes, including omitted output;
+`stderr_truncated` indicates that output exceeded the retention limit. The same
+diagnostics appear inside the report when `--full-output` is selected. Log
+truncation alone does not change the diagnostic health or exit status.
 
 The default terminal format is TOON. Use `--json` when saving results for a
 JSON consumer. `--json` is indented on a terminal and compact when piped or

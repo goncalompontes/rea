@@ -198,13 +198,27 @@ const readFatSlices = async (
   declarations: readonly FatSliceDeclaration[],
 ): Promise<MachoSlice[]> => {
   const slices: MachoSlice[] = [];
+  // Keep validating after an unsupported slice so a later malformed slice is
+  // reported as malformed whatever the slice order.
+  let unsupported: MachoFormatIssue | undefined;
   for (const declaration of declarations) {
     const { offset, size: length, cpuType, cpuSubtype } = declaration;
-    const slice = await readSlice(readAt, offset, length, {
-      fatCpuType: cpuType,
-      fatCpuSubtype: cpuSubtype,
-      alignmentExponent: declaration.alignmentExponent,
-    });
+    let slice: MachoSlice;
+    try {
+      slice = await readSlice(readAt, offset, length, {
+        fatCpuType: cpuType,
+        fatCpuSubtype: cpuSubtype,
+        alignmentExponent: declaration.alignmentExponent,
+      });
+    } catch (cause: unknown) {
+      if (
+        !(cause instanceof MachoFormatIssue) ||
+        cause.status !== "unsupported"
+      )
+        throw cause;
+      unsupported ??= cause;
+      continue;
+    }
     const identityIssue = validateFatSliceIdentity(declaration, {
       cpuType: slice.cpu_type,
       cpuSubtype: slice.cpu_subtype,
@@ -213,6 +227,7 @@ const readFatSlices = async (
       throw new MachoFormatIssue("malformed", identityIssue);
     slices.push(slice);
   }
+  if (unsupported !== undefined) throw unsupported;
   return slices;
 };
 
@@ -456,7 +471,8 @@ const commandString = (
       `load command ${index} has an unterminated string`,
     );
   try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(
+    // lc_str contains name/path data, so a leading U+FEFF is part of its identity.
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
       body.subarray(offset, end),
     );
   } catch {

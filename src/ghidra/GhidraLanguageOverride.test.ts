@@ -11,7 +11,7 @@ import {
   ghidraProfileLanguageOverride,
   sameGhidraLanguageOverride,
 } from "./GhidraAnalysisProfile.js";
-import type { GhidraInstallationHost } from "./GhidraInstallation.js";
+import { ghidraProfileInstallationHost as host } from "./GhidraInstallation.fixture.js";
 import {
   admitGhidraLanguageOverride,
   parseGhidraLanguageDefinitions,
@@ -38,21 +38,6 @@ const X86_LDEFS = `<?xml version="1.0" encoding="UTF-8"?>
   </language>
 </language_definitions>
 `;
-
-// Fake installation inspection; the language catalog is a real directory.
-const host: GhidraInstallationHost = {
-  platform: "linux",
-  architecture: "x64",
-  readText: () => "application.version=12.1.4\napplication.java.min=21\n",
-  executable: () => true,
-  probeJava: () => ({
-    version: "21.0.11",
-    major: 21,
-    home: "/jdk-21",
-    bits: 64,
-    runtime: "jdk",
-  }),
-};
 
 const pe: BinaryTarget = {
   path: "/fixture.exe",
@@ -248,102 +233,107 @@ describe("Ghidra language catalog", () => {
   });
 });
 
-describe("Ghidra language override profile", () => {
-  it("returns a provider failure for a malformed installed language definition", async () => {
-    const path = join(
-      installDir,
-      "Ghidra/Processors/x86/data/languages/broken.ldefs",
-    );
-    await writeFile(
-      path,
-      "<language_definitions><language></language_definitions>",
-    );
-    try {
+// The install directory is a real POSIX temp path with the shared Linux
+// installation fixture; the profile lane is verified on Linux/macOS.
+describe.skipIf(process.platform === "win32")(
+  "Ghidra language override profile",
+  () => {
+    it("returns a provider failure for a malformed installed language definition", async () => {
+      const path = join(
+        installDir,
+        "Ghidra/Processors/x86/data/languages/broken.ldefs",
+      );
+      await writeFile(
+        path,
+        "<language_definitions><language></language_definitions>",
+      );
+      try {
+        const resolved = await provider({
+          REA_GHIDRA_LANGUAGE_ID: "x86:LE:32:default",
+        }).resolveAnalysisProfile(pe);
+        if (resolved.ok) throw new Error("Expected a language catalog failure");
+        expect(resolved.error).toMatchObject({
+          providerId: "ghidra",
+          operation: "resolve_analysis_profile",
+        });
+      } finally {
+        await rm(path);
+      }
+    });
+
+    it("commits the configured language and compiler spec", async () => {
+      const resolved = await provider({
+        REA_GHIDRA_LANGUAGE_ID: "x86:LE:32:default",
+        REA_GHIDRA_COMPILER_SPEC_ID: "borlandcpp",
+      }).resolveAnalysisProfile(pe);
+      if (!resolved.ok) throw resolved.error;
+      const parameters = resolved.value.profile?.parameters ?? {};
+      expect(parameters).toMatchObject({
+        loader: "auto-from-header",
+        language_id: "x86:LE:32:default",
+        compiler_spec_id: "borlandcpp",
+        language_selection: "configured-v1",
+      });
+      expect(ghidraProfileLanguageOverride(parameters)).toEqual({
+        languageId: "x86:LE:32:default",
+        compilerSpecId: "borlandcpp",
+      });
+    });
+
+    it("records the language default when no compiler spec is configured", async () => {
       const resolved = await provider({
         REA_GHIDRA_LANGUAGE_ID: "x86:LE:32:default",
       }).resolveAnalysisProfile(pe);
-      if (resolved.ok) throw new Error("Expected a language catalog failure");
-      expect(resolved.error).toMatchObject({
-        providerId: "ghidra",
-        operation: "resolve_analysis_profile",
+      if (!resolved.ok) throw resolved.error;
+      const parameters = resolved.value.profile?.parameters ?? {};
+      expect(parameters.compiler_spec_id).toBe("language-default");
+      expect(ghidraProfileLanguageOverride(parameters)).toEqual({
+        languageId: "x86:LE:32:default",
       });
-    } finally {
-      await rm(path);
-    }
-  });
-
-  it("commits the configured language and compiler spec", async () => {
-    const resolved = await provider({
-      REA_GHIDRA_LANGUAGE_ID: "x86:LE:32:default",
-      REA_GHIDRA_COMPILER_SPEC_ID: "borlandcpp",
-    }).resolveAnalysisProfile(pe);
-    if (!resolved.ok) throw resolved.error;
-    const parameters = resolved.value.profile?.parameters ?? {};
-    expect(parameters).toMatchObject({
-      loader: "auto-from-header",
-      language_id: "x86:LE:32:default",
-      compiler_spec_id: "borlandcpp",
-      language_selection: "configured-v1",
     });
-    expect(ghidraProfileLanguageOverride(parameters)).toEqual({
-      languageId: "x86:LE:32:default",
-      compilerSpecId: "borlandcpp",
-    });
-  });
 
-  it("records the language default when no compiler spec is configured", async () => {
-    const resolved = await provider({
-      REA_GHIDRA_LANGUAGE_ID: "x86:LE:32:default",
-    }).resolveAnalysisProfile(pe);
-    if (!resolved.ok) throw resolved.error;
-    const parameters = resolved.value.profile?.parameters ?? {};
-    expect(parameters.compiler_spec_id).toBe("language-default");
-    expect(ghidraProfileLanguageOverride(parameters)).toEqual({
-      languageId: "x86:LE:32:default",
+    it("keeps header auto-detection and a distinct digest without an override", async () => {
+      const automatic = await provider({}).resolveAnalysisProfile(pe);
+      const configured = await provider({
+        REA_GHIDRA_LANGUAGE_ID: "x86:LE:32:default",
+        REA_GHIDRA_COMPILER_SPEC_ID: "borlandcpp",
+      }).resolveAnalysisProfile(pe);
+      if (!automatic.ok) throw automatic.error;
+      if (!configured.ok) throw configured.error;
+      const parameters = automatic.value.profile?.parameters ?? {};
+      expect(parameters).toMatchObject({
+        language_id: "auto-from-header",
+        compiler_spec_id: "auto-default",
+      });
+      expect(parameters).not.toHaveProperty("language_selection");
+      expect(ghidraProfileLanguageOverride(parameters)).toBeUndefined();
+      expect(automatic.value.profile?.digest).not.toBe(
+        configured.value.profile?.digest,
+      );
     });
-  });
 
-  it("keeps header auto-detection and a distinct digest without an override", async () => {
-    const automatic = await provider({}).resolveAnalysisProfile(pe);
-    const configured = await provider({
-      REA_GHIDRA_LANGUAGE_ID: "x86:LE:32:default",
-      REA_GHIDRA_COMPILER_SPEC_ID: "borlandcpp",
-    }).resolveAnalysisProfile(pe);
-    if (!automatic.ok) throw automatic.error;
-    if (!configured.ok) throw configured.error;
-    const parameters = automatic.value.profile?.parameters ?? {};
-    expect(parameters).toMatchObject({
-      language_id: "auto-from-header",
-      compiler_spec_id: "auto-default",
+    it("refuses an undefined compiler spec before launching Ghidra", async () => {
+      const resolved = await provider({
+        REA_GHIDRA_LANGUAGE_ID: "x86:LE:32:default",
+        REA_GHIDRA_COMPILER_SPEC_ID: "golang",
+      }).resolveAnalysisProfile(pe);
+      if (resolved.ok) throw new Error("Expected a configuration error");
+      expect(projectAnalysisError(resolved.error)).toMatchObject({
+        code: "configuration_invalid",
+        details: {
+          settings: [{ setting: "REA_GHIDRA_COMPILER_SPEC_ID" }],
+        },
+      });
     });
-    expect(parameters).not.toHaveProperty("language_selection");
-    expect(ghidraProfileLanguageOverride(parameters)).toBeUndefined();
-    expect(automatic.value.profile?.digest).not.toBe(
-      configured.value.profile?.digest,
-    );
-  });
 
-  it("refuses an undefined compiler spec before launching Ghidra", async () => {
-    const resolved = await provider({
-      REA_GHIDRA_LANGUAGE_ID: "x86:LE:32:default",
-      REA_GHIDRA_COMPILER_SPEC_ID: "golang",
-    }).resolveAnalysisProfile(pe);
-    if (resolved.ok) throw new Error("Expected a configuration error");
-    expect(projectAnalysisError(resolved.error)).toMatchObject({
-      code: "configuration_invalid",
-      details: {
-        settings: [{ setting: "REA_GHIDRA_COMPILER_SPEC_ID" }],
-      },
+    it("compares committed and configured selections exactly", () => {
+      expect(sameGhidraLanguageOverride(undefined, undefined)).toBe(true);
+      expect(
+        sameGhidraLanguageOverride(
+          { languageId: "x86:LE:32:default" },
+          { languageId: "x86:LE:32:default", compilerSpecId: "borlandcpp" },
+        ),
+      ).toBe(false);
     });
-  });
-
-  it("compares committed and configured selections exactly", () => {
-    expect(sameGhidraLanguageOverride(undefined, undefined)).toBe(true);
-    expect(
-      sameGhidraLanguageOverride(
-        { languageId: "x86:LE:32:default" },
-        { languageId: "x86:LE:32:default", compilerSpecId: "borlandcpp" },
-      ),
-    ).toBe(false);
-  });
-});
+  },
+);

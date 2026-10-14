@@ -1,4 +1,5 @@
 import * as t from "@babel/types";
+import { traverseJavaScriptAst } from "./javascriptSemanticTraversal.js";
 
 import { htmlUrlText, stripQueryAndFragment } from "../artifactPathSyntax.js";
 import { sanitizeEndpointCandidate } from "../browserObservation.js";
@@ -39,6 +40,11 @@ import {
   isUnmodifiedGlobalReference,
   isUnmodifiedImportMetaUrl,
 } from "./javascriptSemanticAmbientWrites.js";
+import {
+  semanticFactoryLoaderMemberAt,
+  semanticFactoryRequireLoaderAt,
+  semanticRequireLoaderAt,
+} from "./javascriptSemanticRequireOrigin.js";
 
 type JavaScriptCallLike =
   | t.CallExpression
@@ -55,23 +61,26 @@ export const inspectCall = (
   const { accumulator } = context;
   const name = calleeName(node.callee);
   const first = stringValue(node.arguments[0]);
-  const module = context.accumulator.moduleRangeIndex.find(node.start);
-  const moduleRequireName = module?.requireName ?? null;
-  const requireCall = requireCallSpecifier(node, name, moduleRequireName);
+  const requireCall = requireCallSpecifier(node, bindings, context);
   if (requireCall !== null)
     addReference(context, {
       node,
       kind: "require",
       specifier: requireCall.specifier,
     });
-  const chunkLoad = chunkLoadSpecifier(node, name, moduleRequireName);
+  const chunkLoad = chunkLoadSpecifier(node, bindings, context);
   if (chunkLoad !== null)
     addReference(context, {
       node,
       kind: "dynamic-import",
       specifier: chunkLoad.specifier,
     });
-  for (const specifier of vitePreloadDependencySpecifiers(source, node, name))
+  for (const specifier of vitePreloadDependencySpecifiers(
+    node,
+    name,
+    context.vitePreloadDependencyTable,
+    bindings,
+  ))
     addReference(context, { node, kind: "dynamic-import", specifier });
   const worker = t.isNewExpression(node) ? node : undefined;
   const workerConstructor =
@@ -94,13 +103,19 @@ export const inspectCall = (
           ? undefined
           : workerUrlSpecifier(worker, bindings)),
     });
-  if (name.endsWith("serviceWorker.register"))
+  if (
+    name === "serviceWorker.register" ||
+    name.endsWith(".serviceWorker.register")
+  )
     addReference(context, { node, kind: "service-worker", specifier: first });
   inspectEndpointCall(node, name, first, context);
   inspectStorageCall(node, name, first, context);
   if (first === "audio" || first === "video")
     noteMediaElementPreloads(node, accumulator);
-  if (name.endsWith("loadFile") && first !== undefined)
+  if (
+    (name === "loadFile" || name.endsWith(".loadFile")) &&
+    first !== undefined
+  )
     addLocatedFinding(context, {
       collection: accumulator.roles,
       key: `role\0renderer\0${first}`,
@@ -114,7 +129,7 @@ export const inspectCall = (
         location: range(node),
       },
     });
-  if (name.endsWith("loadURL") && first !== undefined)
+  if ((name === "loadURL" || name.endsWith(".loadURL")) && first !== undefined)
     addLocatedFinding(context, {
       collection: accumulator.roles,
       key: `role\0renderer\0${first}`,
@@ -212,57 +227,185 @@ const noteMediaElementPreloads = (
 
 const requireCallSpecifier = (
   node: JavaScriptCallLike,
-  name: string,
-  moduleRequireName: string | null,
+  bindings: JavaScriptSemanticAnalysisState,
+  context: FindingContext,
 ): { readonly specifier: string | undefined } | null => {
-  if (name === "require" || name.endsWith(".require"))
-    return { specifier: argumentValue(node.arguments[0]) };
-  if (name === "__webpack_require__" || name === moduleRequireName)
-    return { specifier: argumentValue(node.arguments[0]) };
-  if (
-    name === "__webpack_require__.bind" ||
-    (moduleRequireName !== null && name === `${moduleRequireName}.bind`)
-  )
-    return { specifier: argumentValue(node.arguments[1]) };
+  const bareRequire = t.isIdentifier(node.callee, { name: "require" });
+  if (bareRequire) {
+    const loader = semanticRequireLoaderAt(
+      node,
+      bindings,
+      context.accumulator.factoryRequireBindingIds,
+    );
+    if (loader === "local") return null;
+    if (loader === "unknown") context.accumulator.unknownFindings += 1;
+    return {
+      specifier:
+        loader === "unknown" ? undefined : argumentValue(node.arguments[0]),
+    };
+  }
+  const factoryLoader = semanticFactoryRequireLoaderAt(
+    node,
+    bindings,
+    context.accumulator.factoryRequireBindingIds,
+  );
+  if (factoryLoader === "factory-loader")
+    return {
+      specifier: argumentValue(
+        node.arguments[
+          t.isMemberExpression(unwrapJavaScriptExpression(node.callee).node) ||
+          t.isOptionalMemberExpression(
+            unwrapJavaScriptExpression(node.callee).node,
+          )
+            ? 1
+            : 0
+        ],
+      ),
+    };
+  if (factoryLoader === "unknown") {
+    context.accumulator.unknownFindings += 1;
+    return { specifier: undefined };
+  }
   return null;
 };
 
 const chunkLoadSpecifier = (
   node: JavaScriptCallLike,
-  name: string,
-  moduleRequireName: string | null,
+  bindings: JavaScriptSemanticAnalysisState,
+  context: FindingContext,
 ): { readonly specifier: string | undefined } | null => {
-  if (
-    name !== "__webpack_require__.e" &&
-    (moduleRequireName === null || name !== `${moduleRequireName}.e`)
-  )
-    return null;
+  const loader = semanticFactoryLoaderMemberAt(
+    node,
+    bindings,
+    context.accumulator.factoryRequireBindingIds,
+    "e",
+  );
+  if (loader === undefined) return null;
+  if (loader === "unknown") return { specifier: undefined };
   return { specifier: prefixedArgument("chunk:", node.arguments[0]) };
 };
 
 const vitePreloadDependencySpecifiers = (
-  source: string,
   node: JavaScriptCallLike,
   name: string,
-): readonly string[] => {
-  if (name !== "__vite__mapDeps" || !t.isArrayExpression(node.arguments[0]))
+  table: readonly (string | undefined)[] | null,
+  bindings: JavaScriptSemanticAnalysisState,
+): readonly (string | undefined)[] => {
+  if (
+    name !== "__vite__mapDeps" ||
+    table === null ||
+    !t.isArrayExpression(node.arguments[0])
+  )
     return [];
-  const indexes = node.arguments[0].elements.flatMap((element) =>
-    t.isNumericLiteral(element) ? [element.value] : [],
-  );
-  if (indexes.length !== node.arguments[0].elements.length) return [];
-  const table = vitePreloadDependencyTable(source);
-  return indexes.flatMap((index) => table[index] ?? []);
+  const indexes = node.arguments[0].elements;
+  // Explicit cache overrides change which table the helper reads. Retain the
+  // call slots as unknown unless every override is statically undefined.
+  if (
+    !node.arguments
+      .slice(1)
+      .every((argument) => isExplicitDefaultArgument(argument, bindings))
+  )
+    return indexes.map(() => undefined);
+  return indexes.map((element) => {
+    if (element === null || !t.isNumericLiteral(element)) return undefined;
+    const index = element.value;
+    return Number.isSafeInteger(index) && index >= 0 ? table[index] : undefined;
+  });
 };
 
-const vitePreloadDependencyTable = (source: string): readonly string[] => {
-  const match =
-    /\.\s*f\s*\|\|\s*\(\s*[^)]*?\.f\s*=\s*\[([\s\S]*?)\]\s*\)/u.exec(source);
-  const body = match?.[1];
-  if (body === undefined) return [];
-  return [
-    ...body.matchAll(/"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'/gu),
-  ].map((literal) => literal[1] ?? literal[2] ?? "");
+const isExplicitDefaultArgument = (
+  argument: t.CallExpression["arguments"][number],
+  bindings: JavaScriptSemanticAnalysisState,
+): boolean => {
+  if (!t.isNode(argument)) return false;
+  const value = unwrapJavaScriptExpression(argument).node;
+  return (
+    (t.isUnaryExpression(value) && value.operator === "void") ||
+    (t.isIdentifier(value, { name: "undefined" }) &&
+      isUnmodifiedGlobalReference(value, bindings, "undefined"))
+  );
+};
+
+type ViteMapDepsFunction =
+  | t.FunctionDeclaration
+  | t.FunctionExpression
+  | t.ArrowFunctionExpression;
+
+/** Index the canonical Vite helper's cache initializer from parsed syntax. */
+export const indexVitePreloadDependencyTable = (
+  program: t.Program,
+): readonly (string | undefined)[] | null => {
+  const helpers: ViteMapDepsFunction[] = [];
+  traverseJavaScriptAst(program, {
+    enter: (node) => {
+      if (t.isFunctionDeclaration(node) && node.id?.name === "__vite__mapDeps")
+        helpers.push(node);
+      else if (
+        t.isVariableDeclarator(node) &&
+        t.isIdentifier(node.id, { name: "__vite__mapDeps" })
+      ) {
+        const init = node.init;
+        if (t.isFunctionExpression(init) || t.isArrowFunctionExpression(init))
+          helpers.push(init);
+      }
+    },
+  });
+  if (helpers.length !== 1) return null;
+  const helper = helpers[0];
+  if (helper === undefined) return null;
+  const mapParameter = helper.params[1];
+  const mapIdentifier = t.isAssignmentPattern(mapParameter)
+    ? mapParameter.left
+    : mapParameter;
+  if (!t.isIdentifier(mapIdentifier)) return [];
+  const tables: t.ArrayExpression[] = [];
+  traverseJavaScriptAst(helper, {
+    skip: (node) => t.isFunction(node),
+    enter: (node) => {
+      if (
+        t.isAssignmentExpression(node) &&
+        node.operator === "=" &&
+        (t.isMemberExpression(node.left) ||
+          t.isOptionalMemberExpression(node.left)) &&
+        t.isIdentifier(node.left.object, { name: mapIdentifier.name }) &&
+        semanticStaticPropertyName(node.left.property, node.left.computed) ===
+          "f" &&
+        t.isArrayExpression(node.right)
+      )
+        tables.push(node.right);
+    },
+  });
+  if (tables.length !== 1) return [];
+  const table = tables[0];
+  if (table === undefined) return [];
+  const dependencies = table.elements.map((element) =>
+    element === null || t.isSpreadElement(element)
+      ? undefined
+      : stringValue(element),
+  );
+  let escapedOrMutated = false;
+  traverseJavaScriptAst(program, {
+    skip: (node) => node === helper,
+    enter: (node, parent) => {
+      if (!t.isIdentifier(node, { name: "__vite__mapDeps" })) return;
+      if (
+        (parent === helper &&
+          t.isFunctionDeclaration(parent) &&
+          parent.id === node) ||
+        (t.isVariableDeclarator(parent) &&
+          parent.init === helper &&
+          parent.id === node)
+      )
+        return;
+      if (
+        (t.isCallExpression(parent) || t.isOptionalCallExpression(parent)) &&
+        parent.callee === node
+      )
+        return;
+      escapedOrMutated = true;
+    },
+  });
+  return escapedOrMutated ? dependencies.map(() => undefined) : dependencies;
 };
 
 const inspectEndpointCall = (
@@ -292,8 +435,9 @@ const inspectEndpointCall = (
     addEndpoint(context, {
       node,
       kind: "network",
-      value: endpoint,
+      value: endpoint.value,
       mechanism: `call:${name}`,
+      ...(endpoint.kind === "candidate" ? { interpretation: "candidate" } : {}),
     });
 };
 
@@ -309,11 +453,12 @@ export const inspectRouteProperty = (
   context: FindingContext,
 ): void => {
   const key = semanticStaticPropertyName(node.key, node.computed);
-  if ((key === "path" || key === "route") && t.isStringLiteral(node.value))
+  const value = stringValue(node.value);
+  if ((key === "path" || key === "route") && value !== undefined)
     addEndpoint(context, {
       node,
       kind: "route",
-      value: node.value.value,
+      value,
       mechanism: `property:${key}`,
     });
 };
@@ -401,12 +546,15 @@ export const addReference = (
 const addEndpoint = (context: FindingContext, input: EndpointInput): void =>
   addLocatedFinding(context, {
     collection: context.accumulator.endpoints,
-    key: `endpoint\0${input.kind}\0${input.value}`,
+    key: `endpoint\0${input.kind}\0${input.interpretation ?? "literal"}\0${input.value}`,
     node: input.node,
     value: {
       kind: input.kind,
       value: sanitizeEndpointCandidate(input.value),
       mechanism: input.mechanism,
+      ...(input.interpretation === undefined
+        ? {}
+        : { interpretation: input.interpretation }),
       module_key: null,
       location: range(input.node),
     },

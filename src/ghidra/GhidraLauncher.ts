@@ -157,6 +157,13 @@ export interface GhidraHeadlessLauncherOptions {
   readonly platform?: NodeJS.Platform;
   /** Open a pre-imported project copy instead of importing the target again. */
   readonly existingProject?: GhidraExistingProject;
+  /**
+   * Import the target without `-readOnly`, so Ghidra saves the analyzed program
+   * into the (owned, throwaway) project at the caller's `projectRoot`. The
+   * caller persists that saved project after the process exits. Mutually
+   * exclusive with `existingProject`.
+   */
+  readonly saveImportedProject?: true;
   readonly comSpec?: string;
   /** Select the admitted 16-bit real-mode MZ import instead of auto-detection. */
   readonly dosMz?: true;
@@ -178,6 +185,8 @@ export interface GhidraHeadlessLauncherOptions {
   readonly mipsSoftFloat?: true;
   /** Spawn seam for provider-boundary lifecycle tests. */
   readonly spawnProcess?: typeof spawnOwnedProviderProcess;
+  /** LaunchSupport probe seam for Java-free launcher fixtures. */
+  readonly javaLaunch?: typeof ghidraJavaLaunch;
 }
 
 /** Launch Ghidra without copying scripts into or modifying its installation. */
@@ -284,6 +293,9 @@ export class GhidraHeadlessLauncher implements GhidraLauncher {
         ...(existingProject === undefined
           ? {}
           : { existingProject: { programName: existingProject.programName } }),
+        ...(this.options.saveImportedProject === undefined
+          ? {}
+          : { saveImportedProject: this.options.saveImportedProject }),
         bridgeScriptPath: this.options.bridgeScriptPath,
         descriptorPath: paths.descriptorPath,
         ghidraLogPath: paths.ghidraLogPath,
@@ -325,43 +337,46 @@ export class GhidraHeadlessLauncher implements GhidraLauncher {
         throw new GhidraLaunchError(
           "POSIX Ghidra requires its inspected JDK home",
         );
+      const inspectedJavaLaunch = await (
+        this.options.javaLaunch ?? ghidraJavaLaunch
+      )({
+        platform,
+        analyzeHeadlessPath: this.options.analyzeHeadlessPath,
+        ...(this.options.javaHome === undefined
+          ? {}
+          : { javaHome: this.options.javaHome }),
+        ...(this.options.javaVmName === undefined
+          ? {}
+          : { javaVmName: this.options.javaVmName }),
+        homeRoot: paths.homeRoot,
+        tempRoot: paths.tempRoot,
+        arguments: headlessArguments,
+        environment,
+        onStderr: (mode, stderr) => {
+          if (stderr === "") return;
+          const bytes = Buffer.byteLength(stderr);
+          const redacted = redactCapturedTransportCredential(
+            { text: stderr, bytes, observedBytes: bytes },
+            session.token,
+            "[REDACTED]",
+          );
+          const bounded = boundedUtf8Text(
+            redacted,
+            GHIDRA_LAUNCH_COMMAND_OUTPUT_BYTES,
+          );
+          launchSupport.push({
+            mode,
+            stderr: bounded.text,
+            stderr_bytes: bytes,
+            stderr_truncated: bounded.truncated,
+          });
+        },
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+      });
       const command =
-        platform !== "win32" && this.options.javaHome !== undefined
-          ? await ghidraJavaLaunch({
-              platform,
-              analyzeHeadlessPath: this.options.analyzeHeadlessPath,
-              javaHome: this.options.javaHome,
-              ...(this.options.javaVmName === undefined
-                ? {}
-                : { javaVmName: this.options.javaVmName }),
-              homeRoot: paths.homeRoot,
-              tempRoot: paths.tempRoot,
-              arguments: headlessArguments,
-              environment,
-              onStderr: (mode, stderr) => {
-                if (stderr === "") return;
-                const bytes = Buffer.byteLength(stderr);
-                const redacted = redactCapturedTransportCredential(
-                  { text: stderr, bytes, observedBytes: bytes },
-                  session.token,
-                  "[REDACTED]",
-                );
-                const bounded = boundedUtf8Text(
-                  redacted,
-                  GHIDRA_LAUNCH_COMMAND_OUTPUT_BYTES,
-                );
-                launchSupport.push({
-                  mode,
-                  stderr: bounded.text,
-                  stderr_bytes: bytes,
-                  stderr_truncated: bounded.truncated,
-                });
-              },
-              ...(options.signal === undefined
-                ? {}
-                : { signal: options.signal }),
-            })
-          : { ...scriptCommand, environment };
+        platform === "win32"
+          ? { ...scriptCommand, environment }
+          : inspectedJavaLaunch;
       started = await (this.options.spawnProcess ?? spawnOwnedProviderProcess)({
         command: command.command,
         arguments: command.arguments,
@@ -552,6 +567,8 @@ export interface GhidraHeadlessArgumentOptions {
   readonly existingProject?: {
     readonly programName: string;
   };
+  /** Import without `-readOnly` so the analyzed program is saved to the project. */
+  readonly saveImportedProject?: true;
   readonly bridgeScriptPath: string;
   readonly descriptorPath: string;
   readonly ghidraLogPath: string;
@@ -584,6 +601,10 @@ export const ghidraHeadlessArguments = (
   const override = options.languageOverride;
   const rawBinary = options.rawBinary;
   const existing = options.existingProject;
+  if (existing !== undefined && options.saveImportedProject === true)
+    throw new Error(
+      "A saved-import Ghidra project and a pre-imported existing project cannot be combined.",
+    );
   if (existing !== undefined) {
     // The pre-imported project carries its own analysis; every import-time
     // selection is therefore rejected instead of silently ignored. The Windows
@@ -717,8 +738,12 @@ export const ghidraHeadlessArguments = (
       : []),
     // An existing project opens with -noanalysis: its auto-analysis was paid
     // when the project was imported, outside this session's startup deadline.
+    // A saved-import project stays writable so Ghidra writes the analyzed
+    // program, which the caller persists after the process exits.
     ...(existing === undefined
-      ? ["-readOnly", "-deleteProject"]
+      ? options.saveImportedProject === true
+        ? []
+        : ["-readOnly", "-deleteProject"]
       : ["-noanalysis", "-readOnly"]),
     "-log",
     options.ghidraLogPath,
@@ -918,7 +943,7 @@ export const copyExistingGhidraProject = async (
           await pipeline(
             handle.createReadStream({ autoClose: false }),
             createWriteStream(to, { flags: "wx", mode: 0o600 }),
-            { ...(signal === undefined ? {} : { signal }) },
+            (signal === undefined ? {} : { signal }),
           );
         },
         { symlinks: "reject", signal },

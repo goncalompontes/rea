@@ -14,7 +14,7 @@ import {
   ghidraMipsProfileParameters,
   ghidraPinnedMipsLanguage,
 } from "./GhidraMipsProfile.js";
-import type { GhidraInstallationHost } from "./GhidraInstallation.js";
+import { ghidraProfileInstallationHost as host } from "./GhidraInstallation.fixture.js";
 import { GHIDRA_SESSION_CAPABILITIES } from "./GhidraSessionValues.js";
 import {
   GhidraHeadlessLauncher,
@@ -27,20 +27,6 @@ import {
   ghidraProfileLanguageOverride,
 } from "./GhidraAnalysisProfile.js";
 
-// Fake installation inspection tests admission/profile contracts, not Ghidra.
-const host: GhidraInstallationHost = {
-  platform: "linux",
-  architecture: "x64",
-  readText: () => "application.version=12.1.4\napplication.java.min=21\n",
-  executable: () => true,
-  probeJava: () => ({
-    version: "21.0.11",
-    major: 21,
-    home: "/jdk-21",
-    bits: 64,
-    runtime: "jdk",
-  }),
-};
 const parsed = parseConfig({ GHIDRA_INSTALL_DIR: "/ghidra" });
 if (!parsed.ok) throw parsed.error;
 const config = parsed.value;
@@ -56,6 +42,7 @@ const target = (change: Partial<MipsElfMetadata> = {}): BinaryTarget => ({
     byteOrder: "little",
     type: 2,
     flags: 0x70001001,
+    gnuAttributes: null,
     abiFlags: {
       version: 0,
       isaLevel: 32,
@@ -114,6 +101,7 @@ describe("bounded Ghidra MIPS admission", () => {
         flags1: 0,
         flags2: 0,
       },
+      gnu_attributes: null,
     });
     expect(left.value.profile?.digest).not.toBe(right.value.profile?.digest);
     const windows = new GhidraProvider(
@@ -160,7 +148,13 @@ describe("bounded Ghidra MIPS admission", () => {
         reason: expect.stringContaining(reason),
       });
       const resolved = await ghidra.resolveAnalysisProfile(value);
-      expect(resolved.ok).toBe(false);
+      expect(resolved).toMatchObject({
+        ok: false,
+        error: {
+          _tag: "AnalysisUnsupportedTargetError",
+          reason: expect.stringContaining(reason),
+        },
+      });
     },
   );
 
@@ -185,7 +179,13 @@ describe("recordless legacy MIPS32 admission", () => {
       status: "unsupported",
     });
     const resolved = await ghidra.resolveAnalysisProfile(object);
-    expect(resolved.ok).toBe(false);
+    expect(resolved).toMatchObject({
+      ok: false,
+      error: {
+        _tag: "AnalysisUnsupportedTargetError",
+        reason: expect.stringContaining("ET_EXEC"),
+      },
+    });
   });
 
   it.each([
@@ -362,61 +362,66 @@ const session = async (
   };
 };
 
-describe("soft-float saved-project preparation", () => {
-  it.each([report, undefined])(
-    "requires the storage report after preparing an existing project (%j)",
-    async (reported) => {
-      const selected = parseConfig({
-        GHIDRA_INSTALL_DIR: "/ghidra",
-        REA_GHIDRA_EXISTING_PROJECT: "/projects/soft-float",
-        REA_GHIDRA_EXISTING_PROGRAM: "fixture.elf",
-      });
-      if (!selected.ok) throw selected.error;
-      const value = target(softFloat);
-      const { counts, launchers, profile, client } = await session(
-        value,
-        reported,
-        value,
-        selected.value,
-      );
-      const health = await client.execute("health", {});
-      expect(profile.parameters.import_mode).toBe("existing-project-copy");
-      const [launcher] = launchers;
-      if (!(launcher instanceof GhidraHeadlessLauncher))
-        throw new Error("Expected the production headless launcher");
-      expect(launcher.options.mipsSoftFloat).toBe(true);
-      expect(launcher.options.languageOverride).toBeUndefined();
-      expect(launcher.options.existingProject).toEqual({
-        projectPath: "/projects/soft-float",
-        programName: "fixture.elf",
-      });
-      const args = ghidraHeadlessArguments({
-        platform: "linux",
-        projectRoot: "/runtime/copied-project",
-        targetPath: value.path,
-        existingProject: launcher.options.existingProject!,
-        mipsSoftFloat: launcher.options.mipsSoftFloat!,
-        bridgeScriptPath: launcher.options.bridgeScriptPath,
-        descriptorPath: "/runtime/session.json",
-        ghidraLogPath: "/runtime/ghidra.log",
-        scriptLogPath: "/runtime/script.log",
-      });
-      expect(args).toContain("-noanalysis");
-      expect(args).toContain("-readOnly");
-      expect(
-        args.some((arg) => arg.endsWith("/ReaGhidraMipsSoftFloat.java")),
-      ).toBe(true);
-      expect(health.ok).toBe(reported !== undefined);
-      if (!health.ok) expect(health.error._tag).toBe("ProviderAdapterError");
-      expect(counts).toEqual({
-        starts: 1,
-        calls: 0,
-        closes: reported === undefined ? 1 : 0,
-      });
-      await client.close();
-    },
-  );
-});
+// The MIPS soft-float saved-project lane pins the POSIX bridge path flavor
+// ("/ReaGhidraMipsSoftFloat.java"), so it is verified on Linux/macOS only.
+describe.skipIf(process.platform === "win32")(
+  "soft-float saved-project preparation",
+  () => {
+    it.each([report, undefined])(
+      "requires the storage report after preparing an existing project (%j)",
+      async (reported) => {
+        const selected = parseConfig({
+          GHIDRA_INSTALL_DIR: "/ghidra",
+          REA_GHIDRA_EXISTING_PROJECT: "/projects/soft-float",
+          REA_GHIDRA_EXISTING_PROGRAM: "fixture.elf",
+        });
+        if (!selected.ok) throw selected.error;
+        const value = target(softFloat);
+        const { counts, launchers, profile, client } = await session(
+          value,
+          reported,
+          value,
+          selected.value,
+        );
+        const health = await client.execute("health", {});
+        expect(profile.parameters.import_mode).toBe("existing-project-copy");
+        const [launcher] = launchers;
+        if (!(launcher instanceof GhidraHeadlessLauncher))
+          throw new Error("Expected the production headless launcher");
+        expect(launcher.options.mipsSoftFloat).toBe(true);
+        expect(launcher.options.languageOverride).toBeUndefined();
+        expect(launcher.options.existingProject).toEqual({
+          projectPath: "/projects/soft-float",
+          programName: "fixture.elf",
+        });
+        const args = ghidraHeadlessArguments({
+          platform: "linux",
+          projectRoot: "/runtime/copied-project",
+          targetPath: value.path,
+          existingProject: launcher.options.existingProject!,
+          mipsSoftFloat: launcher.options.mipsSoftFloat!,
+          bridgeScriptPath: launcher.options.bridgeScriptPath,
+          descriptorPath: "/runtime/session.json",
+          ghidraLogPath: "/runtime/ghidra.log",
+          scriptLogPath: "/runtime/script.log",
+        });
+        expect(args).toContain("-noanalysis");
+        expect(args).toContain("-readOnly");
+        expect(
+          args.some((arg) => arg.endsWith("/ReaGhidraMipsSoftFloat.java")),
+        ).toBe(true);
+        expect(health.ok).toBe(reported !== undefined);
+        if (!health.ok) expect(health.error._tag).toBe("ProviderAdapterError");
+        expect(counts).toEqual({
+          starts: 1,
+          calls: 0,
+          closes: reported === undefined ? 1 : 0,
+        });
+        await client.close();
+      },
+    );
+  },
+);
 
 describe("legacy profile bindings", () => {
   it("refuses a legacy endian pin committed for a different target", async () => {
@@ -545,7 +550,7 @@ describe("MIPS16 shared-image profile", () => {
       );
     },
   );
-  it.each(["sharedLoad", "abiFlags"] as const)(
+  it.each(["sharedLoad", "abiFlags", "gnuAttributes"] as const)(
     "refuses an uninspected %s declaration",
     (declaration) => {
       const value = shared();
@@ -559,9 +564,11 @@ describe("MIPS16 shared-image profile", () => {
       ).toMatchObject({
         status: "unsupported",
         reason: expect.stringContaining(
-          declaration === "abiFlags"
-            ? "inspected ABI flags"
-            : "have not been inspected",
+          {
+            abiFlags: "inspected ABI flags",
+            gnuAttributes: "GNU MIPS ABI attribute inspection is unavailable",
+            sharedLoad: "have not been inspected",
+          }[declaration],
         ),
       });
     },

@@ -1,7 +1,7 @@
 {
   "name": "rea-agents",
   "mcpName": "io.github.morluto/rea",
-  "version": "6.4.0",
+  "version": "6.5.0",
   "description": "Reverse engineer anything from your terminal or agent with one CLI and MCP server.",
   "license": "MIT",
   "repository": {
@@ -21,10 +21,14 @@
     "mcp-server",
     "model-context-protocol",
     "static-analysis",
-    "disassembler",
+    "rea",
     "decompiler",
     "mcp",
-    "hopper"
+    "hopper",
+    "electron",
+    "javascript-analysis",
+    "ghidra",
+    "ida"
   ],
   "publishConfig": {
     "access": "public"
@@ -45,6 +49,7 @@
     "dist",
     "install.sh",
     "bridge/hopper_bridge.py",
+    "bridge/cutter/rea_bridge.py",
     "bridge/native/NativeUIChildren.swift",
     "bridge/native/ReaNativeUI.swift",
     "bridge/native/rea_lldb_tracer.py",
@@ -113,7 +118,9 @@
     "precheck:pr": "npm run deps:check",
     "check:pr": "node scripts/run-exclusive.mjs artifacts turbo run typecheck lint:built format:check knip metadata:check test:run && npm run test:python && npm run docs:check && npm run jscpd && npm run scan:todos",
     "precheck:ci": "npm run deps:check",
-    "check:ci": "node scripts/run-exclusive.mjs artifacts turbo run typecheck lint:built format:check knip metadata:check jscpd scan:todos && npm run verify:architecture-guards",
+    "check:ci": "node scripts/run-exclusive.mjs artifacts npm run check:ci:tasks && npm run verify:architecture-guards",
+    "check:ci:tasks": "turbo run typecheck lint:built format:check knip metadata:check jscpd scan:todos",
+    "ci:static-context": "node scripts/ci/static-task-context.mjs",
     "build:cached": "node scripts/check-dependency-install.mjs && node scripts/run-exclusive.mjs artifacts turbo run artifacts:skills",
     "build:termux": "node scripts/run-exclusive.mjs artifacts npm run build:termux:run",
     "build:termux:run": "npm run compile:termux && npm run artifacts:skills",
@@ -131,9 +138,10 @@
     "test": "npm run test:with-build",
     "test:with-build": "npm run test:prepare && vitest run",
     "test:run": "vitest run",
-    "test:python": "python3 -m unittest bridge/native/test_rea_lldb_tracer.py -v && python3 -m unittest discover -s experiments/analysis-efficiency -p 'test_*.py' -v",
+    "test:python": "python3 -m unittest bridge/native/test_rea_lldb_tracer.py bridge/mitmproxy/test_capture.py -v && python3 -m unittest discover -s experiments/analysis-efficiency -p 'test_*.py' -v",
     "test:local": "node scripts/run-development-tests.mjs local",
-    "test:fast": "vitest run --project domain --project services --project adapters --project composition --project conformance --project evaluation",
+    "test:fast": "node scripts/ci/test-group.mjs source",
+    "test:built": "node scripts/ci/test-group.mjs built",
     "pretest:boundary": "npm run test:prepare",
     "test:boundary": "vitest run --project boundary --project cli-boundary --project process-boundary --project mcp-boundary --project process-global",
     "pretest:mcp": "node scripts/check-dependency-install.mjs && node scripts/run-exclusive.mjs artifacts turbo run artifacts:skills artifacts:mcp-catalog",
@@ -145,6 +153,10 @@
     "test:integration": "vitest run --project boundary --project cli-boundary --project process-boundary --project mcp-boundary --project process-global --project acceptance",
     "pretest:coverage": "npm run test:prepare",
     "test:coverage": "vitest run --coverage.enabled --coverage.provider=v8",
+    "test:coverage:reverse-tools": "vitest run --config vitest.reverse-tools.config.ts --coverage.enabled",
+    "pretest:coverage:reverse-tools": "npm run test:prepare",
+    "test:mutation:reverse-tools": "node scripts/prepare-reverse-tools-mutation.mjs && stryker run stryker.config.mjs && stryker run stryker.semantics.config.mjs",
+    "pretest:mutation:reverse-tools": "npm run test:prepare",
     "test:ci": "npm run test:coverage -- --reporter=default --reporter=junit --outputFile.junit=test-results.xml",
     "pretest:ci:shard": "npm run test:prepare",
     "test:ci:shard": "npm run test:ci:shard:run",
@@ -174,6 +186,7 @@
     "verify:ghidra": "npm run build:cached && node scripts/verify-real-ghidra.mjs",
     "verify:ghidra:seeds": "npm run build:cached && node scripts/verify/ghidra/seeds.mjs",
     "verify:ghidra:mips": "npm run build:cached && node scripts/verify-real-ghidra-mips.mjs",
+    "verify:ghidra:ppc": "npm run build:cached && node scripts/verify-real-ghidra-ppc.mjs",
     "verify:ghidra:riscv": "npm run build:cached && node scripts/verify-real-ghidra-riscv.mjs",
     "verify:ghidra:6502": "npm run build:cached && node scripts/verify-real-ghidra-6502.mjs",
     "verify:ghidra:mips-shared": "npm run build:cached && node scripts/verify-real-ghidra-mips-shared.mjs",
@@ -253,6 +266,7 @@
     "build:windows-native": "node scripts/build-windows-native.mjs",
     "verify:windows-native:artifact": "node scripts/verify-windows-native-artifact.mjs",
     "prepublishOnly": "npm run verify:windows-native:artifact",
+    "verify:cutter": "npm run build:cached && node scripts/verify-real-cutter.mjs",
     "verify:windows-native": "node scripts/verify-windows-native.mjs",
     "verify:ghidra:windows:package": "node scripts/verify-packaged-ghidra-windows.mjs",
     "build:ghidra:nativeaot": "node scripts/build-ghidra-nativeaot.mjs",
@@ -327,6 +341,7 @@
     "pino": "10.4.0",
     "playwright-core": "1.58.2",
     "plist": "5.0.0",
+    "saxes": "6.0.0",
     "semver": "7.8.5",
     "smol-toml": "1.9.0",
     "stream-chain": "4.2.6",
@@ -338,12 +353,18 @@
     "zod": "4.4.3"
   },
   "overrides": {
+    "typed-rest-client": {
+      "qs": "6.16.0"
+    },
     "vitepress": {
       "vite": "6.4.4"
     }
   },
   "devDependencies": {
     "@fast-check/vitest": "0.5.0",
+    "@stryker-mutator/core": "10.0.0",
+    "@stryker-mutator/typescript-checker": "10.0.0",
+    "@stryker-mutator/vitest-runner": "10.0.0",
     "@types/cross-spawn": "6.0.6",
     "@types/node": "26.6.4",
     "@types/semver": "7.7.1",
@@ -360,6 +381,7 @@
     "turbo": "2.11.7",
     "typescript": "7.0.2",
     "typescript-termux": "npm:typescript@5.9.3",
+    "typescript6": "npm:typescript@6.0.3",
     "vitepress": "1.6.4",
     "vitest": "5.0.3"
   },

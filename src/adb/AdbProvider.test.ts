@@ -91,11 +91,71 @@ it("inspects the adb client without contacting the server", async () => {
   expect(result.contacted_adb_server).toBe(false);
 });
 
+it("fails closed when adb exits successfully without a recognized version", async () => {
+  const stdout = `unexpected adb output ${"x".repeat(700)}\n`;
+  const stderr = `probe stderr ${"y".repeat(700)}\n`;
+  const { binary } = await writeAdbStub(
+    () => `printf '%s' '${stdout}'; printf '%s' '${stderr}' >&2; exit 0`,
+  );
+  await expect(
+    providerOver(binary).inspectAvailability(),
+  ).resolves.toMatchObject({
+    status: "unavailable",
+    code: "version_unresolved",
+    diagnostics: {
+      version_probe: "unrecognized_output",
+      stdout,
+      stderr,
+    },
+  });
+});
+
+it("accepts adb's recognized protocol version when the build version is absent", async () => {
+  const { binary } = await writeAdbStub(
+    () => `printf 'Android Debug Bridge version 1.0.41\\n'`,
+  );
+  await expect(
+    providerOver(binary).inspectAvailability(),
+  ).resolves.toMatchObject({
+    status: "available",
+  });
+});
+
 it("lists devices with inferred kinds and observed daemon startup", async () => {
   const { binary } = await writeAdbStub(
     () => `if [ "$1" = "version" ]; then ${VERSION_BLOCK}; exit 0; fi
 if [ "$1" = "devices" ]; then
   printf '* daemon not running; starting now at tcp:5037\\n* daemon started successfully\\n'
+  printf 'List of devices attached\\n'
+  printf 'emulator-5554          device product:sdk_gphone64_x86_64 model:sdk_gphone64_x86_64 device:emu64xa transport_id:1\\n'
+  exit 0
+fi`,
+  );
+  const result = await evidenceResult(providerOver(binary), {
+    operation: "list_adb_devices",
+    input: {},
+  });
+  expect(result.may_have_started_adb_server).toBe(true);
+  expect(result.devices).toEqual([
+    {
+      serial: "emulator-5554",
+      state: "device",
+      transport: "tcp",
+      product: "sdk_gphone64_x86_64",
+      model: "sdk_gphone64_x86_64",
+      device: "emu64xa",
+      transport_id: 1,
+      kind: "emulator",
+      kind_basis: "emulator_serial_prefix",
+    },
+  ]);
+});
+
+it("observes daemon startup when notices are printed to stderr", async () => {
+  const { binary } = await writeAdbStub(
+    () => `if [ "$1" = "version" ]; then ${VERSION_BLOCK}; exit 0; fi
+if [ "$1" = "devices" ]; then
+  printf '* daemon not running; starting now at tcp:5037\\n* daemon started successfully\\n' >&2
   printf 'List of devices attached\\n'
   printf 'emulator-5554          device product:sdk_gphone64_x86_64 model:sdk_gphone64_x86_64 device:emu64xa transport_id:1\\n'
   exit 0
@@ -240,11 +300,12 @@ const shellStub = (
 ): ((root: string) => string) => {
   const cases = Object.entries(dispatch)
     .map(([key, output]) => {
-      const [first, second] = key.split(":");
-      const guard =
-        second === undefined
-          ? `[ "$4" = "${first}" ]`
-          : `[ "$4" = "${first}" ] && [ "$5" = "${second}" ]`;
+      const [first, second, third] = key.split(":");
+      const guard = [
+        `[ "$4" = "${first}" ]`,
+        ...(second === undefined ? [] : [`[ "$5" = "${second}" ]`]),
+        ...(third === undefined ? [] : [`[ "$6" = "${third}" ]`]),
+      ].join(" && ");
       return `  if ${guard}; then printf '%b' '${output.replaceAll("\\", "\\\\").replaceAll("\0", "\\000").replace(/'/gu, "'\\''")}'; exit 0; fi`;
     })
     .join("\n");
@@ -379,6 +440,30 @@ exit 1`,
   expect(result.error.capturedOutput?.stdout).toContain(
     pmOutput.split("\n")[0],
   );
+  const projected = projectAnalysisError(result.error);
+  const duplicate = pmOutput.includes("\n");
+  expect(projected).toMatchObject({
+    code: "unreadable_output",
+    message: expect.stringContaining("pm path for com.example"),
+    remediation: { action: expect.stringContaining("details.diagnostics") },
+    details: {
+      reason: duplicate ? "duplicate_local_destination" : "unsafe_device_path",
+      diagnostics: {
+        package_name: "com.example",
+        ...(duplicate
+          ? { device_paths: ["/data/app/x/base.apk", "/data/app/y/base.apk"] }
+          : {
+              rejected_paths: [
+                {
+                  device_path: "/data/app/x/",
+                  reason: "empty_file_name",
+                },
+              ],
+            }),
+      },
+      captured_output: { stdout: expect.stringContaining("package:") },
+    },
+  });
   await expect(readFile(join(root, "pull-ran"))).rejects.toThrow();
   await expect(lstat(output)).rejects.toMatchObject({ code: "ENOENT" });
 });
@@ -410,7 +495,15 @@ it.each([
     if (aliases) {
       expect(result.ok).toBe(false);
       if (result.ok) return;
-      expect(result.error.message).toContain("unique local destinations");
+      expect(projectAnalysisError(result.error)).toMatchObject({
+        message: expect.stringContaining("unique local destination"),
+        details: {
+          reason: "local_destination_unavailable",
+          diagnostics: {
+            device_path: `/data/app/y/${secondName}`,
+          },
+        },
+      });
       await expect(readFile(pullLog)).rejects.toThrow();
       await expect(lstat(packageDirectory)).rejects.toThrow();
       return;
@@ -1015,6 +1108,60 @@ it("inspects the display and window focus", async () => {
   );
 });
 
+it("reads Android 16 focus declarations from displays when windows omits them", async () => {
+  const { binary } = await writeAdbStub(
+    shellStub({
+      "dumpsys:window:windows": "Window state has no focus fields\\n",
+      "dumpsys:window:displays":
+        "mCurrentFocus=Window{abc u0 com.example/.Main}\nmFocusedApp=ActivityRecord{def u0 com.example/.Main t1}\n",
+    }),
+  );
+  const result = await evidenceResult(providerOver(binary), {
+    operation: "inspect_adb_window",
+    input: { serial: "emulator-5554" },
+  });
+  expect(result).toMatchObject({
+    focused_window: "Window{abc u0 com.example/.Main}",
+    focused_app: "ActivityRecord{def u0 com.example/.Main t1}",
+    observed_lines: [
+      "Window{abc u0 com.example/.Main}",
+      "ActivityRecord{def u0 com.example/.Main t1}",
+    ],
+  });
+  const execution = await providerOver(binary).execute({
+    operation: "inspect_adb_window",
+    input: { serial: "emulator-5554" },
+  });
+  expect(execution.ok).toBe(true);
+  if (!execution.ok) throw execution.error;
+  expect(execution.value.limitations).toContainEqual(
+    expect.stringContaining("dumpsys window displays"),
+  );
+});
+
+it("describes missing window focus as unknown after both sections omit declarations", async () => {
+  const { binary } = await writeAdbStub(
+    shellStub({
+      "dumpsys:window:windows": "no focus\\n",
+      "dumpsys:window:displays": "no focus\\n",
+    }),
+  );
+  const result = await evidenceResult(providerOver(binary), {
+    operation: "inspect_adb_window",
+    input: { serial: "emulator-5554" },
+  });
+  expect(result).toMatchObject({ focused_window: null, focused_app: null });
+  const execution = await providerOver(binary).execute({
+    operation: "inspect_adb_window",
+    input: { serial: "emulator-5554" },
+  });
+  expect(execution.ok).toBe(true);
+  if (!execution.ok) throw execution.error;
+  expect(execution.value.limitations).toContainEqual(
+    expect.stringContaining("focus is unknown"),
+  );
+});
+
 it("reads one settings value and reports device-side nulls", async () => {
   const { binary } = await writeAdbStub(shellStub({ "settings:get": "1\n" }));
   const enabled = await evidenceResult(providerOver(binary), {
@@ -1075,15 +1222,21 @@ exit 1`,
   const apk = join(root, "app.apk");
   await writeFile(apk, "apk");
   const digest = createHash("sha256").update("apk").digest("hex");
-  const installed = await evidenceResult(providerOver(binary), {
+  const execution = await providerOver(binary).execute({
     operation: "install_adb_package",
     input: { serial: "emulator-5554", apk_path: apk, replace: false },
   });
-  expect(installed).toMatchObject({
+  expect(execution.ok).toBe(true);
+  if (!execution.ok) throw execution.error;
+  expect(execution.value.result).toMatchObject({
     bytes: 3,
     sha256: digest,
-    replaced: false,
+    replace_requested: false,
+    replaced: null,
   });
+  expect(execution.value.limitations).toContain(
+    "Whether an existing package was replaced is unknown; replace_requested records only the adb install mode",
+  );
 
   const { binary: failing } = await writeAdbStub(
     () => `if [ "$1" = "version" ]; then ${VERSION_BLOCK}; exit 0; fi

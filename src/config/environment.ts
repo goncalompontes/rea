@@ -14,18 +14,27 @@ import {
   ghidraExistingProjectPathSchema,
 } from "./ghidraExistingProject.js";
 import {
+  ghidraProjectCacheDirectorySchema,
+  ghidraProjectCacheMaxAgeDaysSchema,
+  ghidraProjectCacheMaxBytesSchema,
+  ghidraProjectCacheModeSchema,
+} from "./ghidraProjectCache.js";
+import {
   DEFAULT_GHIDRA_STARTUP_TIMEOUT_MS,
   DEFAULT_HOPPER_STARTUP_TIMEOUT_MS,
   DEFAULT_SWIFTC_COMPILE_TIMEOUT_MS,
   providerStartupTimeoutSchema,
 } from "./providerStartupTimeout.js";
 import { mcpInputSchemaProfileSchema } from "./mcpInputSchemaProfile.js";
+import { mcpOutputSchemaProfileSchema } from "./mcpOutputSchemaProfile.js";
 import { mcpResponseBudgetSchema } from "./mcpResponseBudget.js";
+import { parseLoaderArgs, parseStringArray } from "./parsers.js";
 
 const environmentSchema = z.object({
   REA_ANALYSIS_PROVIDER: analysisProviderSelectorSchema.default("auto"),
   REA_MCP_MAX_RESPONSE_BYTES: mcpResponseBudgetSchema.optional(),
   REA_MCP_INPUT_SCHEMA_PROFILE: mcpInputSchemaProfileSchema.optional(),
+  REA_MCP_OUTPUT_SCHEMA_PROFILE: mcpOutputSchemaProfileSchema.optional(),
   REA_IDA_MCP_CONFIG: z
     .string()
     .min(1)
@@ -65,6 +74,12 @@ const environmentSchema = z.object({
     .optional(),
   REA_GHIDRA_EXISTING_PROJECT: ghidraExistingProjectPathSchema.optional(),
   REA_GHIDRA_EXISTING_PROGRAM: ghidraExistingProgramNameSchema.optional(),
+  REA_GHIDRA_PROJECT_CACHE: ghidraProjectCacheModeSchema,
+  REA_GHIDRA_PROJECT_CACHE_DIR: ghidraProjectCacheDirectorySchema.optional(),
+  REA_GHIDRA_PROJECT_CACHE_MAX_BYTES:
+    ghidraProjectCacheMaxBytesSchema.optional(),
+  REA_GHIDRA_PROJECT_CACHE_MAX_AGE_DAYS:
+    ghidraProjectCacheMaxAgeDaysSchema.optional(),
   REA_ILSPY_CMD_PATH: z
     .string()
     .min(1)
@@ -80,9 +95,17 @@ const environmentSchema = z.object({
   REA_REFERENCE_SECRET_PATTERNS_JSON: z.string().default("[]"),
 });
 
-export type Environment = z.infer<typeof environmentSchema>;
+type Environment = Omit<
+  z.infer<typeof environmentSchema>,
+  "HOPPER_LOADER_ARGS_JSON" | "REA_REFERENCE_SECRET_PATTERNS_JSON"
+> & {
+  readonly loaderArgs: readonly string[];
+  readonly referenceSecretPatterns: readonly string[];
+};
+export type { Environment };
 
-export const parseEnvironment = (
+/** Parse individual settings before layered registration fragments are merged. */
+export const parseEnvironmentValues = (
   environment: Readonly<Record<string, string | undefined>>,
 ): Result<Environment, ConfigurationError> => {
   const parsed = environmentSchema.safeParse(environment);
@@ -99,5 +122,49 @@ export const parseEnvironment = (
       }),
     );
   }
-  return ok(parsed.data);
+  const {
+    HOPPER_LOADER_ARGS_JSON: encodedLoaderArgs,
+    REA_REFERENCE_SECRET_PATTERNS_JSON: encodedSecretPatterns,
+    ...env
+  } = parsed.data;
+  const loaderArgs = parseLoaderArgs(encodedLoaderArgs);
+  if (!loaderArgs.ok) return loaderArgs;
+  const secretPatterns = parseStringArray(
+    encodedSecretPatterns,
+    "REA_REFERENCE_SECRET_PATTERNS_JSON",
+  );
+  if (!secretPatterns.ok) return secretPatterns;
+  return ok({
+    ...env,
+    loaderArgs: loaderArgs.value,
+    referenceSecretPatterns: secretPatterns.value,
+  });
+};
+
+/** Validate complete runtime semantics without probing the host or persisting defaults. */
+export const parseEnvironment = (
+  environment: Readonly<Record<string, string | undefined>>,
+  // Registration expressions are not evaluated; their absence is not proven.
+  unresolvedSettings: ReadonlySet<string> = new Set(),
+): Result<Environment, ConfigurationError> => {
+  const parsed = parseEnvironmentValues(environment);
+  if (!parsed.ok) return parsed;
+  const env = parsed.value;
+  // Ghidra's analyzeHeadless accepts -cspec only together with -processor.
+  if (
+    env.REA_GHIDRA_COMPILER_SPEC_ID !== undefined &&
+    env.REA_GHIDRA_LANGUAGE_ID === undefined &&
+    !unresolvedSettings.has("REA_GHIDRA_LANGUAGE_ID")
+  )
+    return err(
+      new ConfigurationError("Invalid REA environment configuration", {
+        settings: [
+          {
+            setting: "REA_GHIDRA_COMPILER_SPEC_ID",
+            constraint: "requires REA_GHIDRA_LANGUAGE_ID",
+          },
+        ],
+      }),
+    );
+  return parsed;
 };

@@ -27,6 +27,10 @@ import { range } from "./javascriptStaticAnalysisHelpers.js";
 import {
   propertyName,
   semanticStaticPropertyKey,
+  semanticWrappedWriteSite,
+  semanticWriteSiteReadsFirst,
+  semanticWriteSiteTarget,
+  unwrapJavaScriptExpression,
 } from "./javascriptAstValues.js";
 import {
   isTypeOnlyExportDeclaration,
@@ -98,7 +102,7 @@ export const collectSemanticModuleLink = (
         kind: "export",
         specifier: null,
         importedName: null,
-        localName: defaultDeclarationName(node.declaration),
+        localName: defaultExportLocalName(node.declaration),
         exportedName: "default",
         callableId: semanticCallableIdForNode(node.declaration),
         location: range(node),
@@ -175,12 +179,17 @@ export function* collectSemanticReferencesSteps(
           !patterns.some((pattern) => bindsIdentifier(pattern, parent, node)))
       )
         return;
-      const role = semanticIdentifierRole(node, parent, readAncestors());
+      const ancestors = readAncestors();
+      const role = semanticIdentifierRole(node, parent, ancestors);
       if (role === null) return;
       // A compound assignment or update reads before it writes; emit both so
       // reference consumers see the read they actually execute.
       const roles =
-        role === "write" && semanticReadsBeforeWrite(node, parent)
+        role === "write" &&
+        semanticReadsBeforeWrite(
+          node,
+          semanticWrappedWriteSite(node, parent, ancestors) ?? parent,
+        )
           ? (["read", "write"] as const)
           : ([role] as const);
       for (const resolvedRole of roles) {
@@ -548,6 +557,11 @@ const addModuleLink = (
     callableId: link.callableId ?? null,
   };
   state.moduleLinks.push(collected);
+  if (
+    t.isExportDefaultDeclaration(referenceNode) &&
+    t.isExpression(referenceNode.declaration)
+  )
+    state.defaultExportExpressions.set(collected, referenceNode.declaration);
   if (link.localName !== null) {
     const binding = resolveSemanticBindingState(
       state,
@@ -594,12 +608,15 @@ const declarationCallableId = (
  */
 export const semanticReadsBeforeWrite = (
   node: t.Node,
-  parent: t.Node,
-): boolean =>
-  (t.isAssignmentExpression(parent) &&
-    parent.left === node &&
-    parent.operator !== "=") ||
-  (t.isUpdateExpression(parent) && parent.argument === node);
+  site: t.Node,
+): boolean => {
+  const target = semanticWriteSiteTarget(site);
+  return (
+    target !== null &&
+    unwrapJavaScriptExpression(target).node === node &&
+    semanticWriteSiteReadsFirst(site)
+  );
+};
 
 /**
  * Role of one identifier occurrence, given the node's ancestry.
@@ -620,6 +637,8 @@ export const semanticIdentifierRole = (
     if (isPatternOwnerDeclaration(patternAncestor)) return null;
     return "write";
   }
+  const site = semanticWrappedWriteSite(node, parent, ancestors);
+  if (site !== null && site !== parent && !isDeleteSite(site)) return "write";
   return semanticReferenceRole(node, parent);
 };
 
@@ -683,6 +702,9 @@ const isPatternNode = (node: t.Node): boolean =>
   t.isArrayPattern(node) ||
   t.isAssignmentPattern(node) ||
   t.isRestElement(node);
+
+const isDeleteSite = (site: t.Node): boolean =>
+  t.isUnaryExpression(site, { operator: "delete" });
 
 const isPatternOwnerDeclaration = (node: t.Node): boolean =>
   (t.isVariableDeclarator(node) && t.isPattern(node.id)) ||
@@ -799,13 +821,16 @@ const declarationNames = (declaration: t.Declaration): string[] => {
   return [];
 };
 
-const defaultDeclarationName = (
+const defaultExportLocalName = (
   declaration: t.ExportDefaultDeclaration["declaration"],
-): string | null =>
-  (t.isFunctionDeclaration(declaration) || t.isClassDeclaration(declaration)) &&
-  t.isIdentifier(declaration.id)
-    ? declaration.id.name
+): string | null => {
+  const value = unwrapJavaScriptExpression(declaration).node;
+  if (t.isIdentifier(value)) return value.name;
+  return (t.isFunctionDeclaration(value) || t.isClassDeclaration(value)) &&
+    t.isIdentifier(value.id)
+    ? value.id.name
     : null;
+};
 
 const commonJsExportName = (
   node: t.Node,
@@ -815,16 +840,15 @@ const commonJsExportName = (
   if (!t.isMemberExpression(node) && !t.isOptionalMemberExpression(node))
     return undefined;
   const key = semanticStaticPropertyKey(node.property, node.computed);
-  // `exports[key]`/`module.exports[key]` assign an export whose name is not
-  // knowable. Report the wildcard rather than the variable name, and never
-  // collapse it into `default`, which would claim a real default export.
+  // A computed nonliteral key is unknown, but the empty string is a real exact
+  // CommonJS export name and must not collapse into the wildcard/default.
   if (isUnshadowedGlobal(node.object, state, "exports"))
-    return key === null ? "*" : key || "*";
+    return key === null ? "*" : key;
   if (
     t.isMemberExpression(node.object) &&
     isCommonJsModuleExports(node.object, state)
   )
-    return key === null ? "*" : key || "default";
+    return key === null ? "*" : key;
   if (isCommonJsModuleExports(node, state)) return "default";
   return undefined;
 };

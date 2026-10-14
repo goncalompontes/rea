@@ -18,8 +18,10 @@ import {
 } from "./javascriptSemanticProjection.js";
 import {
   semanticObjectPatternKeys,
+  runtimeFunctionParameters,
   semanticStaticPropertyKey,
   semanticWriteTargets,
+  unwrapJavaScriptExpression,
 } from "./javascriptAstValues.js";
 import type {
   JavaScriptSemanticAnalysisState,
@@ -41,6 +43,7 @@ import {
   traverseJavaScriptAstSteps,
 } from "./javascriptSemanticTraversal.js";
 import { semanticRequireOrigin } from "./javascriptSemanticRequireOrigin.js";
+import { semanticBundledRequireOrigin } from "./javascriptBundledRequireOrigin.js";
 import { collectSemanticMemberMutationsSteps } from "./javascriptSemanticMemberMutations.js";
 import { indexJavaScriptAmbientWritesSteps } from "./javascriptSemanticAmbientWrites.js";
 import { hasUncertainTypeOnlyModuleSideEffect } from "./javascriptModuleDeclaration.js";
@@ -57,7 +60,6 @@ import {
   ELECTRON_MODULE,
 } from "./javascriptElectronMemberWrites.js";
 import { range } from "./javascriptStaticAnalysisHelpers.js";
-import { propertyName } from "./javascriptAstValues.js";
 import { semanticCoverage } from "./javascriptSemanticCoverage.js";
 import { semanticResourceLimitsIn } from "./javascriptSemanticResourceLimits.js";
 import {
@@ -76,6 +78,7 @@ interface BindPatternInput {
   readonly scope: JavaScriptSemanticScopeState;
   readonly state: JavaScriptSemanticAnalysisState;
   readonly mutable: boolean;
+  readonly declarationKind?: "var" | "let" | "const" | "using" | "await using";
   readonly kind?: JavaScriptSemanticDefinition["kind"];
   readonly projection?: readonly (string | number | null)[];
   readonly referenceOnly?: boolean;
@@ -99,6 +102,7 @@ interface AddBindingInput {
   readonly name: string;
   readonly kind: JavaScriptSemanticDefinition["kind"];
   readonly mutable: boolean;
+  readonly declarationKind?: "var" | "let" | "const" | "using" | "await using";
   readonly definitionNode: t.Node;
   readonly initializer: t.Node | null;
   readonly directOrigin?: JavaScriptModuleOrigin;
@@ -157,6 +161,7 @@ export function* analyzeParsedJavaScriptSemanticsSteps(
 ): Generator<void, JavaScriptSemanticIr> {
   const state = createState(file.program, staticImportResolutionMode);
   yield* collectDefinitionsSteps(file.program, state);
+  yield* indexJavaScriptAmbientWritesSteps(file.program, state);
   yield* collectSemanticMemberMutationsSteps(file.program, state);
   yield* traverseJavaScriptAstSteps(file.program, {
     enter: (node) => collectSemanticModuleLink(node, state),
@@ -258,7 +263,8 @@ export type JavaScriptOpenReceiverFact =
   | "local"
   | "local-indexed-db"
   | "local-cache-storage"
-  | "configuration";
+  | "configuration"
+  | "extension-state";
 
 /**
  * Resolve only the lexical receiver identity needed to distinguish browser
@@ -278,6 +284,7 @@ export function* classifyParsedJavaScriptOpenReceiversSteps(
   const state = createState(file.program);
   yield* collectDefinitionsSteps(file.program, state);
   const facts = new Map<number, JavaScriptOpenReceiverFact>();
+  const extensionStateReads: number[] = [];
   yield* traverseJavaScriptAstSteps(file.program, {
     enter: (node) => {
       if (
@@ -293,6 +300,8 @@ export function* classifyParsedJavaScriptOpenReceiversSteps(
       if (method === "get") {
         if (isConfigurationReceiver(state, node.callee.object))
           facts.set(node.start ?? -1, "configuration");
+        else if (isExtensionStateMember(node.callee.object))
+          extensionStateReads.push(node.start ?? -1);
         return;
       }
       if (method !== "open" || !t.isIdentifier(node.callee.object)) return;
@@ -358,8 +367,30 @@ export function* classifyParsedJavaScriptOpenReceiversSteps(
       if (aliasFact !== undefined) facts.set(node.start ?? -1, aliasFact);
     },
   });
+  if (extensionStateReads.length > 0 && importsVsCodeModule(state))
+    for (const start of extensionStateReads)
+      facts.set(start, "extension-state");
   return facts;
 }
+
+/** VS Code passes extension state through ExtensionContext, not an import. */
+const isExtensionStateMember = (receiver: t.Node): boolean =>
+  (t.isMemberExpression(receiver) || t.isOptionalMemberExpression(receiver)) &&
+  (() => {
+    const key = semanticStaticPropertyKey(receiver.property, receiver.computed);
+    return key === "globalState" || key === "workspaceState";
+  })();
+
+/** Require module evidence before treating a familiar member as VS Code state. */
+const importsVsCodeModule = (state: JavaScriptSemanticAnalysisState): boolean =>
+  [...state.bindingsById.values()].some(
+    (binding) =>
+      binding.directOrigins.some(({ specifier }) => specifier === "vscode") ||
+      semanticRequireOrigin(
+        semanticStableInitializer(binding, state)?.node,
+        state,
+      )?.origin.specifier === "vscode",
+  );
 
 /**
  * Whether a call spells VS Code's `workspace.getConfiguration(section)`, whose
@@ -522,7 +553,7 @@ export function* indexJavaScriptElectronIdentitySteps(
     const wrapped = interop.callOrigin(root);
     const origin =
       wrapped === undefined
-        ? semanticRequireOrigin(root, state)?.origin
+        ? electronRequireOrigin(root, state)?.origin
         : collectedWrites && interop.invalidatedCall(root)
           ? undefined
           : wrapped.origin;
@@ -606,6 +637,13 @@ const electronExport = (
     : null;
 };
 
+const electronRequireOrigin = (
+  node: t.Node,
+  state: JavaScriptSemanticAnalysisState,
+) =>
+  semanticRequireOrigin(node, state) ??
+  semanticBundledRequireOrigin(node, state);
+
 const bindingOrigin = (
   binding: JavaScriptSemanticBindingState,
   state: JavaScriptSemanticAnalysisState,
@@ -616,7 +654,7 @@ const bindingOrigin = (
       : undefined;
   const initializer = semanticStableInitializer(binding, state);
   if (initializer === undefined) return undefined;
-  const origin = semanticRequireOrigin(initializer.node, state)?.origin;
+  const origin = electronRequireOrigin(initializer.node, state)?.origin;
   const projection = initializer.projection;
   return origin === undefined ||
     !projection.every((key): key is string => typeof key === "string")
@@ -637,6 +675,7 @@ const createState = (
     bindings: new Map(),
   };
   return {
+    program,
     staticImportResolutionMode,
     parentsByNode: new WeakMap(),
     scopes: [root],
@@ -648,8 +687,12 @@ const createState = (
     moduleLinks: [],
     linkedRequireCalls: new WeakSet(),
     moduleLinkBindings: new WeakMap(),
-    conditionalInitializers: new WeakSet(),
+    defaultExportExpressions: new WeakMap(),
+    conditionallySkippedExpressions: new WeakSet(),
+    requiredModuleEffects: new Map(),
+    ambientBindingWrites: new Map(),
     ambientWrites: new SemanticPropertyPathCoverage(),
+    ambientWriteEffects: [],
   };
 };
 
@@ -664,6 +707,7 @@ function* collectDefinitionsSteps(
   const assignments: {
     readonly node: t.Node;
     readonly scope: JavaScriptSemanticScopeState;
+    readonly conditionallySkipped: boolean;
   }[] = [];
   const functionBodies: {
     readonly body: t.BlockStatement;
@@ -718,7 +762,7 @@ function* collectDefinitionsSteps(
           functionBodies.push({
             body: node,
             scope: nested,
-            parameters: parent.params,
+            parameters: runtimeFunctionParameters(parent),
           });
       }
       const scope = currentSemanticScope(stack);
@@ -739,16 +783,23 @@ function* collectDefinitionsSteps(
         node.init != null &&
         parent !== null &&
         t.isVariableDeclaration(parent, { kind: "var" }) &&
-        hasConditionalInitializer(readAncestors())
+        writeMayBeSkipped(node, readAncestors())
       )
-        state.conditionalInitializers.add(node.init);
+        state.conditionallySkippedExpressions.add(node.init);
       if (
         t.isAssignmentExpression(node) ||
         t.isUpdateExpression(node) ||
         t.isForOfStatement(node) ||
         t.isForInStatement(node)
       )
-        assignments.push({ node, scope });
+        assignments.push({
+          node,
+          scope,
+          conditionallySkipped:
+            t.isForOfStatement(node) ||
+            t.isForInStatement(node) ||
+            writeMayBeSkipped(node, readAncestors()),
+        });
     },
     exit: (node) => {
       for (let count = openedScopes.get(node) ?? 0; count > 0; count--)
@@ -757,9 +808,12 @@ function* collectDefinitionsSteps(
   });
   // All declarations must exist before resolving writes, including hoisted
   // functions and local declarations that shadow an outer binding.
-  for (const [index, { node, scope }] of assignments.entries()) {
+  for (const [
+    index,
+    { node, scope, conditionallySkipped },
+  ] of assignments.entries()) {
     if (index % 64 === 0) yield;
-    bindAssignment(node, scope, state);
+    bindAssignment(node, scope, state, conditionallySkipped);
   }
   for (const [index, { body, scope, parameters }] of functionBodies.entries()) {
     if (index % 64 === 0) yield;
@@ -813,22 +867,70 @@ const copyParameterToBody = (input: {
   }
 };
 
-const hasConditionalInitializer = (ancestors: readonly t.Node[]): boolean => {
-  // A hoisted var can remain undefined when control flow skips its initializer.
-  // Conditions outside the owning callable/static block do not govern its body.
+const writeMayBeSkipped = (
+  node: t.Node,
+  ancestors: readonly t.Node[],
+): boolean => {
+  let child = node;
   for (let index = ancestors.length - 1; index >= 0; index -= 1) {
-    const node = ancestors[index];
-    if (t.isFunction(node) || t.isProgram(node) || t.isStaticBlock(node))
-      return false;
+    const parent = ancestors[index];
     if (
-      t.isIfStatement(node) ||
-      t.isLoop(node) ||
-      t.isSwitchCase(node) ||
-      t.isTryStatement(node)
+      parent === undefined ||
+      t.isFunction(parent) ||
+      t.isProgram(parent) ||
+      t.isStaticBlock(parent)
     )
-      return true;
+      return false;
+    if (isSkippedBranch(parent, child)) return true;
+    child = parent;
   }
   return false;
+};
+
+const isSkippedBranch = (parent: t.Node, child: t.Node): boolean => {
+  if (t.isIfStatement(parent))
+    return child === parent.consequent || child === parent.alternate;
+  if (t.isSwitchCase(parent)) return true;
+  if (t.isTryStatement(parent))
+    return child === parent.block || child === parent.handler;
+  if (t.isForStatement(parent))
+    return child === parent.body || child === parent.update;
+  if (t.isWhileStatement(parent)) return child === parent.body;
+  if (t.isDoWhileStatement(parent)) return false;
+  if (t.isForInStatement(parent) || t.isForOfStatement(parent))
+    return child === parent.left || child === parent.body;
+  if (t.isLogicalExpression(parent)) return child === parent.right;
+  if (t.isConditionalExpression(parent))
+    return child === parent.consequent || child === parent.alternate;
+  if (t.isOptionalCallExpression(parent) || t.isCallExpression(parent))
+    return (
+      parent.arguments.includes(child as t.Expression) &&
+      optionalCallArgumentsMayBeSkipped(parent)
+    );
+  if (t.isOptionalMemberExpression(parent))
+    return parent.optional && parent.computed && child === parent.property;
+  return false;
+};
+
+const optionalCallArgumentsMayBeSkipped = (
+  call: t.CallExpression | t.OptionalCallExpression,
+): boolean => {
+  if (t.isOptionalCallExpression(call) && call.optional) return true;
+  let callee: t.Node = call.callee;
+  while (true) {
+    // Parentheses terminate optional-chain short-circuiting. In particular,
+    // `(foo?.bar)(arg)` evaluates arg before attempting the call.
+    if (callee.extra?.parenthesized === true) return false;
+    if (t.isOptionalMemberExpression(callee)) {
+      if (callee.optional) return true;
+      callee = callee.object;
+    } else if (t.isMemberExpression(callee)) callee = callee.object;
+    else if (t.isOptionalCallExpression(callee)) {
+      if (callee.optional) return true;
+      callee = callee.callee;
+    } else if (t.isCallExpression(callee)) callee = callee.callee;
+    else return false;
+  }
 };
 
 const bindOuterDeclaration = (
@@ -877,6 +979,9 @@ const bindInnerDeclaration = (
         parent !== null && t.isVariableDeclaration(parent)
           ? parent.kind !== "const"
           : true,
+      ...(parent !== null && t.isVariableDeclaration(parent)
+        ? { declarationKind: parent.kind }
+        : {}),
     });
   else if (t.isClassExpression(node) && t.isIdentifier(node.id))
     addBinding({
@@ -938,32 +1043,37 @@ const bindAssignment = (
   node: t.Node,
   scope: JavaScriptSemanticScopeState,
   state: JavaScriptSemanticAnalysisState,
+  conditionallySkipped: boolean,
 ): void => {
   if (t.isAssignmentExpression(node)) {
-    if (t.isIdentifier(node.left))
+    const left = unwrapJavaScriptExpression(node.left).node;
+    if (t.isIdentifier(left))
       addAssignment(
-        node.left,
+        left,
         node.operator === "=" ||
           ((node.operator === "||=" || node.operator === "??=") &&
-            !hasIncomingValue(node.left, scope, state))
+            !hasIncomingValue(left, scope, state))
           ? node.right
           : node,
         scope,
         state,
+        conditionallySkipped,
       );
     else
       for (const identifier of semanticWriteTargets(node.left))
         if (t.isIdentifier(identifier))
-          addAssignment(identifier, node, scope, state);
-  } else if (t.isUpdateExpression(node) && t.isIdentifier(node.argument))
-    addAssignment(node.argument, node, scope, state);
-  else if (t.isForOfStatement(node) || t.isForInStatement(node))
+          addAssignment(identifier, node, scope, state, conditionallySkipped);
+  } else if (t.isUpdateExpression(node)) {
+    const argument = unwrapJavaScriptExpression(node.argument).node;
+    if (t.isIdentifier(argument))
+      addAssignment(argument, node, scope, state, conditionallySkipped);
+  } else if (t.isForOfStatement(node) || t.isForInStatement(node))
     for (const pattern of t.isVariableDeclaration(node.left)
       ? node.left.declarations.map(({ id }) => id)
       : [node.left]) {
       for (const identifier of semanticWriteTargets(pattern))
         if (t.isIdentifier(identifier))
-          addAssignment(identifier, node, scope, state);
+          addAssignment(identifier, node, scope, state, conditionallySkipped);
       if (t.isForOfStatement(node))
         // Keep the loop value unknown, but preserve references yielded into
         // each bound slot so writes/escapes can reach their iterable origins.
@@ -1077,7 +1187,7 @@ const scopeKind = (
 };
 
 const functionParametersHaveExpressions = (node: t.Function): boolean => {
-  const pending: t.Node[] = [...node.params];
+  const pending: t.Node[] = [...runtimeFunctionParameters(node)];
   while (pending.length > 0) {
     const parameter = pending.pop();
     if (t.isAssignmentPattern(parameter)) return true;
@@ -1109,7 +1219,7 @@ const bindImports = (
       ? ["default"]
       : t.isImportNamespaceSpecifier(specifier)
         ? []
-        : [propertyName(specifier.imported) || "[dynamic]"];
+        : [semanticStaticPropertyKey(specifier.imported, false) ?? "[dynamic]"];
     addBinding({
       state,
       scope,
@@ -1134,7 +1244,7 @@ const bindFunctionLocals = (
   scope: JavaScriptSemanticScopeState,
   state: JavaScriptSemanticAnalysisState,
 ): void => {
-  for (const parameter of node.params)
+  for (const parameter of runtimeFunctionParameters(node))
     bindPattern({
       pattern: t.isTSParameterProperty(parameter)
         ? parameter.parameter
@@ -1154,6 +1264,7 @@ const bindPattern = (input: BindPatternInput): void => {
     scope,
     state,
     mutable,
+    declarationKind,
     kind = "variable",
     projection = [],
     referenceOnly = false,
@@ -1196,6 +1307,7 @@ const bindPattern = (input: BindPatternInput): void => {
       name: pattern.name,
       kind,
       mutable,
+      ...(declarationKind === undefined ? {} : { declarationKind }),
       definitionNode: pattern,
       initializer,
       projection,
@@ -1298,6 +1410,7 @@ const addBinding = (input: AddBindingInput): void => {
     name,
     kind,
     mutable,
+    declarationKind,
     definitionNode,
     initializer,
     directOrigin,
@@ -1312,6 +1425,8 @@ const addBinding = (input: AddBindingInput): void => {
     state.bindingsById.set(binding.bindingId, binding);
   }
   binding.mutable ||= mutable;
+  if (declarationKind !== undefined)
+    binding.declarationKinds.add(declarationKind);
   binding.definitions.push({ kind, location: range(definitionNode) });
   if (initializer !== null)
     binding.initializers.push({ node: initializer, projection });
@@ -1339,7 +1454,8 @@ const createBinding = (
   name,
   kind,
   mutable,
-  mutatedPaths: [],
+  declarationKinds: new Set(),
+  memberWrites: [],
   escapedPaths: [],
   definitions: [],
   initializers: [],
@@ -1353,14 +1469,24 @@ const addAssignment = (
   initializer: t.Node,
   scope: JavaScriptSemanticScopeState,
   state: JavaScriptSemanticAnalysisState,
+  conditionallySkipped: boolean,
 ): void => {
   const binding = resolveSemanticBindingFromScope(
     scope,
     identifier.name,
     state,
   );
-  if (binding === undefined) return;
+  if (binding === undefined) {
+    // Unbound identifiers can denote host wrapper bindings (such as require),
+    // which are separate from properties written through the global object.
+    const writes = state.ambientBindingWrites.get(identifier.name) ?? [];
+    writes.push(identifier);
+    state.ambientBindingWrites.set(identifier.name, writes);
+    return;
+  }
   binding.mutable = true;
   binding.definitions.push({ kind: "assignment", location: range(identifier) });
   binding.initializers.push({ node: initializer, projection: [] });
+  if (conditionallySkipped)
+    state.conditionallySkippedExpressions.add(initializer);
 };

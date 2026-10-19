@@ -7,6 +7,7 @@ import {
   AnalysisUnsupportedTargetError,
   AnalysisResourceConstraintError,
   AnalysisTargetNotOpenError,
+  AnalysisInProgressError,
   AnalysisTimeoutError,
 } from "./analysisErrorCore.js";
 import { ArtifactOperationError } from "./artifactOperationError.js";
@@ -80,6 +81,8 @@ export const analysisErrorRemediationAction = (
     );
   if (error instanceof AnalysisTargetNotOpenError)
     return "Open the target again or pass one of details.open_target_ids. Target paths are never included in this error.";
+  if (error instanceof AnalysisInProgressError)
+    return "The target is still starting. Retry the same target or increase wait_ms within the 290000 ms cap.";
   if (
     error instanceof AnalysisTimeoutError &&
     error.remediationAction !== undefined
@@ -239,6 +242,7 @@ const STATIC_ERROR_CATEGORIES: Readonly<
   AnalysisTimeoutError: "timeout",
   AnalysisResourceConstraintError: "resource_constraint",
   AnalysisTargetNotOpenError: "unavailable",
+  AnalysisInProgressError: "resource_constraint",
   HopperTimeoutError: "timeout",
   NoBinaryOpenError: "unavailable",
   BinaryTargetError: "unavailable",
@@ -487,6 +491,7 @@ const KNOWN_ERROR_TAGS = {
   AnalysisTimeoutError: true,
   AnalysisResourceConstraintError: true,
   AnalysisTargetNotOpenError: true,
+  AnalysisInProgressError: true,
   ProviderSelectionError: true,
   ProviderAdapterError: true,
   BrowserObservationError: true,
@@ -510,3 +515,4 @@ export const assertKnownAnalysisErrorTag = (tag: AnalysisErrorTag): void => {
   if (KNOWN_ERROR_TAGS[tag] !== true)
     throw new TypeError("Unknown analysis error tag");
 };
+

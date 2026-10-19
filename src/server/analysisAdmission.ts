@@ -10,6 +10,7 @@ export type WithAdmittedAnalysis = <Value>(
   signal: AbortSignal | undefined,
   operation: (analysis: AnalysisOperationPort) => Promise<Value>,
   targetId?: string,
+  waitMs?: number,
 ) => Promise<Result<Value, AnalysisError>>;
 
 /** Select exactly one owner for a server's analysis operation binding. */
@@ -22,12 +23,13 @@ export const withAdmittedAnalysis = (
   source: ServerAnalysisSource,
 ): WithAdmittedAnalysis =>
   source.kind === "session"
-    ? (operationName, signal, operation, targetId) =>
+    ? (operationName, signal, operation, targetId, waitMs) =>
         source.session.withAdmittedAnalysis(
           operationName,
           signal,
           operation,
           targetId,
+          waitMs,
         )
     : async (operationName, signal, operation) =>
         signal?.aborted === true

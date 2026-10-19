@@ -64,6 +64,21 @@ export const openBinaryInputSchema = z
       .describe(
         "Keep existing open targets and add this one instead of replacing the current target. Default false preserves single-target replacement.",
       ),
+    analysis_mode: z
+      .enum(["foreground", "background", "auto"])
+      .default("foreground")
+      .describe(
+        "foreground blocks until ready (default). background starts a server-owned job and returns analysis_started. auto waits up to auto_background_after_ms, then continues in background.",
+      ),
+    auto_background_after_ms: z
+      .number()
+      .int()
+      .min(1)
+      .max(2_147_483_647)
+      .optional()
+      .describe(
+        "Auto-mode promotion threshold in milliseconds; defaults to REA_GHIDRA_AUTO_BACKGROUND_AFTER_MS or 120000.",
+      ),
   })
   .superRefine((value, context) => {
     const pairing = rawBinarySelectionError({

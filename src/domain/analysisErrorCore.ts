@@ -77,6 +77,29 @@ export class AnalysisTargetNotOpenError extends AnalysisError {
   }
 }
 
+/** A bounded wait expired while the selected target was still starting. */
+export class AnalysisInProgressError extends AnalysisError {
+  readonly _tag = "AnalysisInProgressError";
+
+  constructor(
+    readonly operation: string,
+    readonly targetId: string,
+    readonly elapsedMs: number,
+    readonly progress: string | undefined,
+  ) {
+    super(
+      `Analysis for target ${targetId} is still in progress after ${elapsedMs} ms`,
+      {
+        diagnostics: {
+          target_id: targetId,
+          elapsed_ms: elapsedMs,
+          ...(progress === undefined ? {} : { progress }),
+        },
+      },
+    );
+  }
+}
+
 /** Provider-neutral invalid analysis input or output at an application boundary. */
 export class AnalysisProtocolError extends AnalysisError {
   readonly _tag = "AnalysisProtocolError";

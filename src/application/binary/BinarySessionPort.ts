@@ -50,6 +50,7 @@ export interface BinarySessionPort
     signal: AbortSignal | undefined,
     operation: (analysis: AnalysisOperationPort) => Promise<Value>,
     targetId?: string,
+    waitMs?: number,
   ): Promise<Result<Value, AnalysisError>>;
   /** Serialize an external mutation and retire any active target afterward. */
   withAdmittedExternalMutation<Value>(
@@ -85,6 +86,8 @@ export interface BinarySessionPort
       readonly signal?: AbortSignal;
       readonly snapshot?: AnalysisSnapshot;
       readonly keepOthersOpen?: boolean;
+      readonly analysisMode?: "foreground" | "background" | "auto";
+      readonly autoBackgroundAfterMs?: number;
     },
   ): Promise<Result<BinaryTarget, AnalysisError>>;
   open(
@@ -100,6 +103,10 @@ export interface BinarySessionPort
       readonly providerId?: AnalysisProviderSelector;
       /** Keep other open targets instead of replacing them (default false). */
       readonly keepOthersOpen?: boolean;
+      /** Foreground (default), background, or experimental auto promotion. */
+      readonly analysisMode?: "foreground" | "background" | "auto";
+      /** Auto mode promotion threshold; defaults to the registry setting. */
+      readonly autoBackgroundAfterMs?: number;
     },
   ): Promise<Result<BinaryTarget, AnalysisError>>;
   close(
@@ -125,6 +132,7 @@ export interface BinarySessionPort
   status(options?: {
     readonly signal?: AbortSignal;
     readonly targetId?: string;
+    readonly waitMs?: number;
   }): Promise<JsonValue>;
   /** Opaque handle of the current target when the adapter exposes handles. */
   currentTargetId?(): string | undefined;
@@ -133,6 +141,8 @@ export interface BinarySessionPort
     readonly target_id: string;
     readonly target: BinaryTarget;
   }[];
+  /** Current background-analysis state for one target, when tracked. */
+  analysisState?(targetId?: string): JsonValue | undefined;
   activeTarget(targetId?: string): BinaryTarget | undefined;
   exportAnalysisSnapshot(): Result<AnalysisSnapshot, AnalysisError>;
   writeAnalysisSnapshot(

@@ -90,6 +90,7 @@ export const registerSessionStatusTool = (
           ...(input.target_id === undefined
             ? {}
             : { targetId: input.target_id }),
+          ...(input.wait_ms === undefined ? {} : { waitMs: input.wait_ms }),
         });
       } catch (cause) {
         if (!(cause instanceof AnalysisError)) throw cause;

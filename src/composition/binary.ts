@@ -70,6 +70,7 @@ const composeDeepBinarySession = (
     {
       maxOpenTargets: config.maxOpenTargets,
       maxConcurrentAnalyses: config.maxConcurrentAnalyses,
+      autoBackgroundAfterMs: config.ghidraAutoBackgroundAfterMs,
     },
   );
 };

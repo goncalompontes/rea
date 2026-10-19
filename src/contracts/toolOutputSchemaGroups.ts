@@ -86,6 +86,7 @@ import {
   evidenceResultOf,
   segmentOutput,
   sessionProvider,
+  analysisJobState,
   symbolDiscoveryOutput,
   targetFormatSchema,
   targetKindSchema,
@@ -468,6 +469,7 @@ const lifecycleTargetFields = {
     .string()
     .describe("Opaque handle for this open target; pass it to target-bound tools.")
     .optional(),
+  analysis: analysisJobState.optional(),
 };
 const detectedLifecycleTargetSchema = z.object({
   ...lifecycleTargetFields,

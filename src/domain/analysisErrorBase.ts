@@ -13,6 +13,7 @@ const ANALYSIS_ERROR_TAGS = [
   "AnalysisTimeoutError",
   "AnalysisResourceConstraintError",
   "AnalysisTargetNotOpenError",
+  "AnalysisInProgressError",
   "ProviderSelectionError",
   "ProviderAdapterError",
   "BrowserObservationError",

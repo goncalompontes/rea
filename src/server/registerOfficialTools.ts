@@ -63,7 +63,15 @@ const registerOfficialTool = (
         typeof parsedInput.target_id === "string"
           ? parsedInput.target_id
           : undefined;
-      const { target_id: _targetId, ...arguments_ } = parsedInput;
+      const waitMs =
+        typeof parsedInput.wait_ms === "number"
+          ? parsedInput.wait_ms
+          : undefined;
+      const {
+        target_id: _targetId,
+        wait_ms: _waitMs,
+        ...arguments_
+      } = parsedInput;
       const admitted = await registration.withAdmittedAnalysis(
         contract.name,
         context.mcpReq.signal,
@@ -113,6 +121,7 @@ const registerOfficialTool = (
           );
         },
         targetId,
+        waitMs,
       );
       return admitted.ok
         ? admitted.value

@@ -2,9 +2,10 @@ import { randomUUID } from "node:crypto";
 
 import type { AnalysisProfileCommitment } from "../../domain/analysisProfile.js";
 import type { AnalysisSnapshot } from "../../domain/analysisSnapshot.js";
-import type { AnalysisError } from "../../domain/analysisErrorBase.js";
+import { AnalysisError } from "../../domain/analysisErrorBase.js";
 import {
   AnalysisCancelledError,
+  AnalysisInProgressError,
   AnalysisResourceConstraintError,
   AnalysisTargetNotOpenError,
 } from "../../domain/analysisErrorCore.js";
@@ -18,10 +19,12 @@ import type {
   ResolvedSessionOpen,
 } from "./BinarySessionOpen.js";
 import { BinarySession } from "./BinarySession.js";
+import { parseBinaryTarget } from "../BinaryTargetResolver.js";
 import type {
   BinarySessionPort,
   SavedAnalysisSnapshot,
 } from "./BinarySessionPort.js";
+import { binaryTargetSummary } from "./BinaryTargetSummary.js";
 import type { SessionProviderRouter } from "./SessionProviderRouter.js";
 import { InvestigationRecords } from "../investigation/InvestigationRecords.js";
 import type {
@@ -48,16 +51,39 @@ import type { WorkflowSnapshotRecordInput } from "./BinarySessionRecords.js";
 export interface BinaryTargetLimits {
   readonly maxOpenTargets: number;
   readonly maxConcurrentAnalyses: number;
+  readonly autoBackgroundAfterMs: number;
 }
 
 const DEFAULT_LIMITS: BinaryTargetLimits = {
   maxOpenTargets: 4,
   maxConcurrentAnalyses: 2,
+  autoBackgroundAfterMs: 120_000,
 };
+
+const DEFAULT_WAIT_MS = 180_000;
+const MAX_WAIT_MS = 290_000;
 
 interface TargetSlot {
   readonly id: string;
   readonly session: BinarySession;
+}
+
+type AnalysisJobState = "starting" | "ready" | "failed" | "cancelled";
+
+type OpenOptions = NonNullable<Parameters<BinarySessionPort["open"]>[1]>;
+type OpenResolvedOptions = NonNullable<
+  Parameters<BinarySessionPort["openResolvedTarget"]>[1]
+>;
+
+interface AnalysisJob {
+  readonly slot: TargetSlot;
+  readonly target: BinaryTarget;
+  readonly controller: AbortController;
+  readonly startedAt: number;
+  readonly mode: "background" | "auto";
+  state: AnalysisJobState;
+  error: AnalysisError | undefined;
+  readonly promise: Promise<void>;
 }
 
 /**
@@ -74,6 +100,7 @@ export class BinaryTargetRegistry implements BinarySessionPort {
   readonly #records: InvestigationRecords;
   readonly #limits: BinaryTargetLimits;
   readonly #slots = new Map<string, TargetSlot>();
+  readonly #jobs = new Map<string, AnalysisJob>();
   readonly #availabilityListeners = new Set<() => void | Promise<void>>();
   readonly #snapshotListeners = new Set<() => void | Promise<void>>();
   #primary: TargetSlot;
@@ -97,6 +124,10 @@ export class BinaryTargetRegistry implements BinarySessionPort {
         1,
         limits.maxConcurrentAnalyses ?? DEFAULT_LIMITS.maxConcurrentAnalyses,
       ),
+      autoBackgroundAfterMs: Math.max(
+        1,
+        limits.autoBackgroundAfterMs ?? DEFAULT_LIMITS.autoBackgroundAfterMs,
+      ),
     };
     this.#primary = this.#createSlot();
     this.#currentId = this.#primary.id;
@@ -105,7 +136,7 @@ export class BinaryTargetRegistry implements BinarySessionPort {
   /** Currently open target handles in deterministic creation order. */
   targets(): readonly { readonly target_id: string; readonly target: BinaryTarget }[] {
     return [...this.#slots.values()].flatMap((slot) => {
-      const target = slot.session.activeTarget();
+      const target = slot.session.activeTarget() ?? this.#jobs.get(slot.id)?.target;
       return target === undefined
         ? []
         : [{ target_id: slot.id, target }];
@@ -114,15 +145,39 @@ export class BinaryTargetRegistry implements BinarySessionPort {
 
   /** Identifier of the target addressed when a call omits target_id. */
   currentTargetId(): string | undefined {
-    return this.#slotById(this.#currentId)?.session.activeTarget() === undefined
+    return this.#targetForSlot(this.#slotById(this.#currentId)) === undefined
       ? undefined
       : this.#currentId;
+  }
+
+  /** Current background-analysis state for one target, when tracked. */
+  analysisState(targetId?: string): JsonValue | undefined {
+    const slot = this.#resolveSlotResult(targetId);
+    if (!slot.ok) return undefined;
+    const job = this.#jobForSlot(slot.value);
+    if (job === undefined) return undefined;
+    return {
+      state: job.state,
+      mode: job.mode,
+      started_at: new Date(job.startedAt).toISOString(),
+      elapsed_ms: Date.now() - job.startedAt,
+      ...(job.error === undefined
+        ? {}
+        : {
+            error: {
+              code: job.error._tag,
+              message: job.error.message,
+            },
+          }),
+    };
   }
 
   async open(
     path: string,
     options: Parameters<BinarySessionPort["open"]>[1] = {},
   ): Promise<Result<BinaryTarget, AnalysisError>> {
+    if ((options.analysisMode ?? "foreground") !== "foreground")
+      return this.#openAsJob(path, options);
     if (options.keepOthersOpen !== true)
       return this.#openReplacing(path, options);
     const existing = this.#slotForPath(path);
@@ -134,6 +189,8 @@ export class BinaryTargetRegistry implements BinarySessionPort {
     resolved: Pick<ResolvedSessionOpen, "target" | "route">,
     options: Parameters<BinarySessionPort["openResolvedTarget"]>[1] = {},
   ): Promise<Result<BinaryTarget, AnalysisError>> {
+    if ((options.analysisMode ?? "foreground") !== "foreground")
+      return this.#openResolvedAsJob(resolved, options);
     if (options.keepOthersOpen !== true)
       return this.#openResolvedReplacing(resolved, options);
     const existing = this.#slotForPath(resolved.target.path);
@@ -144,8 +201,9 @@ export class BinaryTargetRegistry implements BinarySessionPort {
 
   async #openReplacing(
     path: string,
-    options: Parameters<BinarySessionPort["open"]>[1],
+    options: OpenOptions,
   ): Promise<Result<BinaryTarget, AnalysisError>> {
+    this.#cancelJob(this.#primary);
     const closed = await this.#closeSlotsExcept(this.#primary);
     if (!closed.ok) return closed;
     return this.#openInSlot(this.#primary, path, options);
@@ -153,16 +211,224 @@ export class BinaryTargetRegistry implements BinarySessionPort {
 
   async #openResolvedReplacing(
     resolved: Pick<ResolvedSessionOpen, "target" | "route">,
-    options: Parameters<BinarySessionPort["openResolvedTarget"]>[1],
+    options: OpenResolvedOptions,
   ): Promise<Result<BinaryTarget, AnalysisError>> {
+    this.#cancelJob(this.#primary);
     const closed = await this.#closeSlotsExcept(this.#primary);
     if (!closed.ok) return closed;
     return this.#openResolvedInSlot(this.#primary, resolved, options);
   }
 
+  async #openAsJob(
+    path: string,
+    options: OpenOptions,
+  ): Promise<Result<BinaryTarget, AnalysisError>> {
+    const existing = this.#slotForPath(path);
+    if (existing !== undefined) {
+      const job = this.#jobs.get(existing.id);
+      if (job !== undefined) return this.#jobOpenResult(job, options);
+      const active = existing.session.activeTarget();
+      if (active !== undefined) {
+        this.#currentId = existing.id;
+        return ok(active);
+      }
+    }
+    if (isAborted(options.signal))
+      return err(new AnalysisCancelledError("open_binary"));
+    const parsed = await parseBinaryTarget(path, {
+      ...(options.targetKind === undefined
+        ? {}
+        : { targetKind: options.targetKind }),
+      ...(options.formatHint === undefined
+        ? {}
+        : { formatHint: options.formatHint }),
+      ...(options.architecture === undefined
+        ? {}
+        : { architecture: options.architecture }),
+      ...(options.entryPoint === undefined
+        ? {}
+        : { entryPoint: options.entryPoint }),
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+    });
+    if (!parsed.ok) return parsed;
+    const slot = await this.#slotForJob(options);
+    if (!slot.ok) return slot;
+    return this.#startJob(
+      slot.value,
+      parsed.value,
+      "background",
+      (signal) => slot.value.session.open(path, { ...options, signal }),
+      options,
+    );
+  }
+
+  async #openResolvedAsJob(
+    resolved: Pick<ResolvedSessionOpen, "target" | "route">,
+    options: OpenResolvedOptions,
+  ): Promise<Result<BinaryTarget, AnalysisError>> {
+    const existing = this.#slotForPath(resolved.target.path);
+    if (existing !== undefined) {
+      const job = this.#jobs.get(existing.id);
+      if (job !== undefined) return this.#jobOpenResult(job, options);
+      const active = existing.session.activeTarget();
+      if (active !== undefined) {
+        this.#currentId = existing.id;
+        return ok(active);
+      }
+    }
+    if (isAborted(options.signal))
+      return err(new AnalysisCancelledError("open_binary"));
+    const slot = await this.#slotForJob(options);
+    if (!slot.ok) return slot;
+    return this.#startJob(
+      slot.value,
+      resolved.target,
+      "background",
+      (signal) =>
+        slot.value.session.openResolvedTarget(resolved, { ...options, signal }),
+      options,
+    );
+  }
+
+  async #slotForJob(
+    options: OpenOptions,
+  ): Promise<Result<TargetSlot, AnalysisError>> {
+    if (options.keepOthersOpen === true) {
+      const capacity = this.#checkOpenCapacity("open_binary");
+      if (capacity !== undefined) return capacity;
+      return ok(this.#createSlot());
+    }
+    const closed = await this.#closeSlotsExcept(this.#primary);
+    if (!closed.ok) return closed;
+    const previousJob = this.#jobs.get(this.#primary.id);
+    previousJob?.controller.abort();
+    this.#jobs.delete(this.#primary.id);
+    return ok(this.#primary);
+  }
+
+  #startJob(
+    slot: TargetSlot,
+    target: BinaryTarget,
+    requestedMode: "background" | "auto",
+    start: (signal: AbortSignal) => Promise<Result<BinaryTarget, AnalysisError>>,
+    options: OpenOptions,
+  ): Promise<Result<BinaryTarget, AnalysisError>> {
+    const mode =
+      options.analysisMode === "auto" ? ("auto" as const) : requestedMode;
+    const controller = new AbortController();
+    const startedAt = Date.now();
+    let job!: AnalysisJob;
+    const promise = start(controller.signal).then(
+      (result) => {
+        if (controller.signal.aborted) {
+          job.state = "cancelled";
+          job.error = result.ok
+            ? new AnalysisCancelledError("open_binary")
+            : result.error;
+          return;
+        }
+        if (result.ok) {
+          job.state = "ready";
+          return;
+        }
+        job.state = "failed";
+        job.error = result.error;
+      },
+      (cause: unknown) => {
+        job.state = controller.signal.aborted ? "cancelled" : "failed";
+        job.error =
+          cause instanceof AnalysisError
+            ? cause
+            : new AnalysisCancelledError("open_binary");
+      },
+    );
+    job = {
+      slot,
+      target,
+      controller,
+      startedAt,
+      mode,
+      state: "starting",
+      error: undefined,
+      promise,
+    };
+    this.#slots.set(slot.id, slot);
+    this.#jobs.set(slot.id, job);
+    this.#currentId = slot.id;
+    if (mode === "background") return Promise.resolve(ok(target));
+    const threshold = Math.max(
+      1,
+      options.autoBackgroundAfterMs ?? this.#limits.autoBackgroundAfterMs,
+    );
+    return this.#waitForAutoJob(job, threshold, options.signal).then(
+      (outcome) => {
+        if (outcome === "ready") return ok(target);
+        if (outcome === "failed")
+          return err(job.error ?? new AnalysisCancelledError("open_binary"));
+        if (outcome === "aborted")
+          return err(new AnalysisCancelledError("open_binary"));
+        return ok(target);
+      },
+    );
+  }
+
+  async #waitForAutoJob(
+    job: AnalysisJob,
+    thresholdMs: number,
+    signal: AbortSignal | undefined,
+  ): Promise<"ready" | "failed" | "aborted" | "timeout"> {
+    if (isAborted(signal)) return "aborted";
+    const outcome = await new Promise<
+      "ready" | "failed" | "aborted" | "timeout"
+    >((resolve) => {
+      let settled = false;
+      const finish = (
+        value: "ready" | "failed" | "aborted" | "timeout",
+      ): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        resolve(value);
+      };
+      const timer = setTimeout(() => finish("timeout"), thresholdMs);
+      timer.unref?.();
+      const onAbort = (): void => finish("aborted");
+      signal?.addEventListener("abort", onAbort, { once: true });
+      void job.promise.then(() =>
+        finish(job.state === "ready" ? "ready" : "failed"),
+      );
+    });
+    return outcome;
+  }
+
+  #jobOpenResult(
+    job: AnalysisJob,
+    options: OpenOptions,
+  ): Promise<Result<BinaryTarget, AnalysisError>> {
+    if (job.state === "ready") return Promise.resolve(ok(job.target));
+    if (job.state === "starting" && job.mode === "background")
+      return Promise.resolve(ok(job.target));
+    if (job.state === "failed")
+      return Promise.resolve(
+        err(job.error ?? new AnalysisCancelledError("open_binary")),
+      );
+    if (job.state === "cancelled")
+      return Promise.resolve(err(new AnalysisCancelledError("open_binary")));
+    return this.#waitForAutoJob(
+      job,
+      Math.max(1, options.autoBackgroundAfterMs ?? this.#limits.autoBackgroundAfterMs),
+      options.signal,
+    ).then((outcome) =>
+      outcome === "failed"
+        ? err(job.error ?? new AnalysisCancelledError("open_binary"))
+        : ok(job.target),
+    );
+  }
+
   async #openInNewSlot(
     path: string,
-    options: Parameters<BinarySessionPort["open"]>[1],
+    options: OpenOptions,
   ): Promise<Result<BinaryTarget, AnalysisError>> {
     const capacity = this.#checkOpenCapacity("open_binary");
     if (capacity !== undefined) return capacity;
@@ -171,7 +437,7 @@ export class BinaryTargetRegistry implements BinarySessionPort {
 
   async #openResolvedInNewSlot(
     resolved: Pick<ResolvedSessionOpen, "target" | "route">,
-    options: Parameters<BinarySessionPort["openResolvedTarget"]>[1],
+    options: OpenResolvedOptions,
   ): Promise<Result<BinaryTarget, AnalysisError>> {
     const capacity = this.#checkOpenCapacity("open_binary");
     if (capacity !== undefined) return capacity;
@@ -181,8 +447,15 @@ export class BinaryTargetRegistry implements BinarySessionPort {
   async #openInSlot(
     slot: TargetSlot,
     path: string,
-    options: Parameters<BinarySessionPort["open"]>[1],
+    options: OpenOptions,
   ): Promise<Result<BinaryTarget, AnalysisError>> {
+    const job = this.#jobs.get(slot.id);
+    if (job !== undefined) {
+      await job.promise;
+      return job.state === "ready"
+        ? ok(job.target)
+        : err(job.error ?? new AnalysisCancelledError("open_binary"));
+    }
     const permit = await this.#acquireStartPermit("open_binary", options?.signal);
     if (!permit.ok) return err(permit.error);
     try {
@@ -196,8 +469,15 @@ export class BinaryTargetRegistry implements BinarySessionPort {
   async #openResolvedInSlot(
     slot: TargetSlot,
     resolved: Pick<ResolvedSessionOpen, "target" | "route">,
-    options: Parameters<BinarySessionPort["openResolvedTarget"]>[1],
+    options: OpenResolvedOptions,
   ): Promise<Result<BinaryTarget, AnalysisError>> {
+    const job = this.#jobs.get(slot.id);
+    if (job !== undefined) {
+      await job.promise;
+      return job.state === "ready"
+        ? ok(job.target)
+        : err(job.error ?? new AnalysisCancelledError("open_binary"));
+    }
     const permit = await this.#acquireStartPermit("open_binary", options?.signal);
     if (!permit.ok) return err(permit.error);
     try {
@@ -243,10 +523,13 @@ export class BinaryTargetRegistry implements BinarySessionPort {
   ): Promise<Result<null, AnalysisError>> {
     let failure: AnalysisError | undefined;
     for (const slot of [...this.#slots.values()]) {
-      const closed = await slot.session.closeAsSlot(options, {
-        clearRecords: false,
-        closeOwnedProviderResources: false,
-      });
+      const closed = await (async () => {
+        this.#jobs.get(slot.id)?.controller.abort();
+        return slot.session.closeAsSlot(options, {
+          clearRecords: false,
+          closeOwnedProviderResources: false,
+        });
+      })();
       if (!closed.ok) failure ??= closed.error;
       this.#retireSlot(slot);
     }
@@ -281,6 +564,7 @@ export class BinaryTargetRegistry implements BinarySessionPort {
     const slot = this.#resolveSlot(options.targetId, "close_binary");
     if (!slot.ok) return slot;
     const last = this.#openSlotCount() <= 1;
+    this.#jobs.get(slot.value.id)?.controller.abort();
     const closed = await close(slot.value, {
       clearRecords: last,
       closeOwnedProviderResources: last,
@@ -294,13 +578,45 @@ export class BinaryTargetRegistry implements BinarySessionPort {
   ): Promise<JsonValue> {
     const slot = this.#resolveSlot(options?.targetId, "binary_session");
     if (!slot.ok) throw slot.error;
+    const job = this.#jobForSlot(slot.value);
+    if (job?.state === "starting")
+      await this.#waitForAnalysis(slot.value, "binary_session", {
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+        ...(options.waitMs === undefined ? {} : { waitMs: options.waitMs }),
+      });
     const base = await slot.value.session.status(options);
     if (typeof base !== "object" || base === null || Array.isArray(base))
       return base;
+    const analysis =
+      job === undefined
+        ? undefined
+        : {
+            state: job.state,
+            mode: job.mode,
+            started_at: new Date(job.startedAt).toISOString(),
+            elapsed_ms: Date.now() - job.startedAt,
+            ...(job.error === undefined
+              ? {}
+              : {
+                  error: {
+                    code: job.error._tag,
+                    message: job.error.message,
+                  },
+                }),
+          };
+    const targetFields =
+      job === undefined || base.open === true || job.state === "failed" || job.state === "cancelled"
+        ? {}
+        : {
+            open: true as const,
+            ...binaryTargetSummary(job.target),
+          };
     return {
       ...base,
+      ...targetFields,
       target_id: slot.value.id,
       open_target_ids: this.targets().map(({ target_id }) => target_id),
+      ...(analysis === undefined ? {} : { analysis }),
     };
   }
 
@@ -311,7 +627,11 @@ export class BinaryTargetRegistry implements BinarySessionPort {
   ): Promise<Result<AnalysisExecution, AnalysisError>> {
     const slot = this.#resolveSlot(options?.targetId, name);
     if (!slot.ok) return Promise.resolve(slot);
-    return slot.value.session.execute(name, arguments_, options);
+    return this.#waitForAnalysis(slot.value, name, options).then((ready) =>
+      ready.ok
+        ? slot.value.session.execute(name, arguments_, options)
+        : ready,
+    );
   }
 
   executeIfProviderReady(
@@ -321,6 +641,8 @@ export class BinaryTargetRegistry implements BinarySessionPort {
   ): Promise<Result<AnalysisExecution, AnalysisError> | undefined> {
     const slot = this.#resolveSlot(options?.targetId, name);
     if (!slot.ok) return Promise.resolve(slot);
+    const job = this.#jobForSlot(slot.value);
+    if (job !== undefined && job.state !== "ready") return Promise.resolve(undefined);
     return slot.value.session.executeIfProviderReady(name, arguments_, options);
   }
 
@@ -329,13 +651,21 @@ export class BinaryTargetRegistry implements BinarySessionPort {
     signal: AbortSignal | undefined,
     operation: (analysis: AnalysisOperationPort) => Promise<Value>,
     targetId?: string,
+    waitMs?: number,
   ): Promise<Result<Value, AnalysisError>> {
     const slot = this.#resolveSlot(targetId, operationName);
     if (!slot.ok) return Promise.resolve(slot);
-    return slot.value.session.withAdmittedAnalysis(
-      operationName,
-      signal,
-      operation,
+    return this.#waitForAnalysis(slot.value, operationName, {
+      ...(signal === undefined ? {} : { signal }),
+      ...(waitMs === undefined ? {} : { waitMs }),
+    }).then((ready) =>
+      ready.ok
+        ? slot.value.session.withAdmittedAnalysis(
+            operationName,
+            signal,
+            operation,
+          )
+        : ready,
     );
   }
 
@@ -365,7 +695,7 @@ export class BinaryTargetRegistry implements BinarySessionPort {
 
   activeTarget(targetId?: string): BinaryTarget | undefined {
     const slot = this.#resolveSlotResult(targetId);
-    return slot.ok ? slot.value.session.activeTarget() : undefined;
+    return slot.ok ? this.#targetForSlot(slot.value) : undefined;
   }
 
   providerIdentity(
@@ -531,11 +861,15 @@ export class BinaryTargetRegistry implements BinarySessionPort {
   }
 
   #removeSlot(slot: TargetSlot): void {
+    this.#jobs.get(slot.id)?.controller.abort();
+    this.#jobs.delete(slot.id);
     this.#slots.delete(slot.id);
     if (this.#currentId === slot.id) this.#currentId = this.#primary.id;
   }
 
   #retireSlot(slot: TargetSlot): void {
+    this.#jobs.get(slot.id)?.controller.abort();
+    this.#jobs.delete(slot.id);
     if (slot === this.#primary) {
       this.#slots.delete(slot.id);
       const replacement = this.#firstOpenSlot();
@@ -555,14 +889,14 @@ export class BinaryTargetRegistry implements BinarySessionPort {
 
   #firstOpenSlot(): TargetSlot | undefined {
     return [...this.#slots.values()].find(
-      ({ session }) => session.activeTarget() !== undefined,
+      (slot) => this.#targetForSlot(slot) !== undefined,
     );
   }
 
   #openSlotCount(): number {
     let count = 0;
     for (const slot of this.#slots.values())
-      if (slot.session.activeTarget() !== undefined) count += 1;
+      if (this.#targetForSlot(slot) !== undefined) count += 1;
     return count;
   }
 
@@ -571,9 +905,78 @@ export class BinaryTargetRegistry implements BinarySessionPort {
     return this.#slots.get(targetId);
   }
 
+  #targetForSlot(slot: TargetSlot | undefined): BinaryTarget | undefined {
+    if (slot === undefined) return undefined;
+    return slot.session.activeTarget() ?? this.#jobs.get(slot.id)?.target;
+  }
+
+  #jobForSlot(slot: TargetSlot): AnalysisJob | undefined {
+    return this.#jobs.get(slot.id);
+  }
+
+  #cancelJob(slot: TargetSlot): void {
+    const job = this.#jobs.get(slot.id);
+    if (job === undefined) return;
+    job.controller.abort();
+    this.#jobs.delete(slot.id);
+  }
+
+  async #waitForAnalysis(
+    slot: TargetSlot,
+    operation: string,
+    options: Pick<ExecutionOptions, "signal" | "waitMs"> | undefined,
+  ): Promise<Result<undefined, AnalysisError>> {
+    const job = this.#jobForSlot(slot);
+    if (job === undefined || job.state === "ready") return ok(undefined);
+    if (job.state === "failed")
+      return err(job.error ?? new AnalysisCancelledError(operation));
+    if (job.state === "cancelled")
+      return err(new AnalysisCancelledError(operation));
+    if (isAborted(options?.signal))
+      return err(new AnalysisCancelledError(operation));
+    const waitMs = Math.min(
+      MAX_WAIT_MS,
+      Math.max(1, options?.waitMs ?? DEFAULT_WAIT_MS),
+    );
+    const outcome = await new Promise<"ready" | "failed" | "aborted" | "timeout">(
+      (resolve) => {
+        let settled = false;
+        const finish = (
+          value: "ready" | "failed" | "aborted" | "timeout",
+        ): void => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          options?.signal?.removeEventListener("abort", onAbort);
+          resolve(value);
+        };
+        const timer = setTimeout(() => finish("timeout"), waitMs);
+        timer.unref?.();
+        const onAbort = (): void => finish("aborted");
+        options?.signal?.addEventListener("abort", onAbort, { once: true });
+        void job.promise.then(() =>
+          finish(job.state === "ready" ? "ready" : "failed"),
+        );
+      },
+    );
+    if (outcome === "ready") return ok(undefined);
+    if (outcome === "aborted")
+      return err(new AnalysisCancelledError(operation));
+    if (outcome === "failed")
+      return err(job.error ?? new AnalysisCancelledError(operation));
+    return err(
+      new AnalysisInProgressError(
+        operation,
+        slot.id,
+        Date.now() - job.startedAt,
+        undefined,
+      ),
+    );
+  }
+
   #slotForPath(path: string): TargetSlot | undefined {
-    return [...this.#slots.values()].find(({ session }) => {
-      const target = session.activeTarget();
+    return [...this.#slots.values()].find((slot) => {
+      const target = this.#targetForSlot(slot);
       return target?.path === path || target?.sourcePath === path;
     });
   }
@@ -581,7 +984,7 @@ export class BinaryTargetRegistry implements BinarySessionPort {
   #currentSlot(targetId?: string): TargetSlot {
     if (targetId !== undefined) {
       const slot = this.#slotById(targetId);
-      if (slot !== undefined && slot.session.activeTarget() !== undefined)
+      if (slot !== undefined && this.#targetForSlot(slot) !== undefined)
         return slot;
       return this.#primary;
     }
@@ -594,14 +997,14 @@ export class BinaryTargetRegistry implements BinarySessionPort {
   ): Result<TargetSlot, AnalysisError> {
     if (targetId === undefined) return ok(this.#slotById(this.#currentId) ?? this.#primary);
     const slot = this.#slotById(targetId);
-    if (slot !== undefined && slot.session.activeTarget() !== undefined)
+    if (slot !== undefined && this.#targetForSlot(slot) !== undefined)
       return ok(slot);
     return err(
       new AnalysisTargetNotOpenError(
         operation,
         targetId,
         [...this.#slots.values()]
-          .filter(({ session }) => session.activeTarget() !== undefined)
+          .filter((candidate) => this.#targetForSlot(candidate) !== undefined)
           .map(({ id }) => id),
       ),
     );
@@ -636,6 +1039,7 @@ export class BinaryTargetRegistry implements BinarySessionPort {
   ): Promise<Result<null, AnalysisError>> {
     for (const slot of [...this.#slots.values()]) {
       if (slot === keep) continue;
+      this.#jobs.get(slot.id)?.controller.abort();
       const closed = await slot.session.closeAsSlot(
         {},
         { clearRecords: false, closeOwnedProviderResources: false },
@@ -707,3 +1111,7 @@ export class BinaryTargetRegistry implements BinarySessionPort {
     }
   }
 }
+
+
+const isAborted = (signal: AbortSignal | undefined): boolean =>
+  signal?.aborted === true;

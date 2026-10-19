@@ -467,11 +467,26 @@ export const expandToolAvailability = (
     ),
   );
 
+/** Current server-owned analysis state for one open target. */
+export const analysisJobState = z.object({
+  state: z.enum(["starting", "ready", "failed", "cancelled"]),
+  mode: z.enum(["background", "auto"]),
+  started_at: z.string(),
+  elapsed_ms: z.number().int().min(0),
+  error: z
+    .object({
+      code: z.string(),
+      message: z.string(),
+    })
+    .optional(),
+});
+
 export const sessionProvider = z
   .object({
     cleanup_pending: z.boolean(),
     target_id: z.string().nullable().optional(),
     open_target_ids: z.array(z.string()).optional(),
+    analysis: analysisJobState.optional(),
     capabilities: z.array(providerCapabilitySet),
     analysis_run: analysisRun,
     analysis_activity: analysisActivity,

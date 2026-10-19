@@ -365,11 +365,29 @@ starts; additional starts wait in FIFO order.
 
 Every official analysis tool accepts an optional `target_id`. Omit it to address
 the current target, which keeps single-target transcripts compatible. An unknown
-or closed handle returns `target_unavailable` with the open ids, never target
+or closed handle returns `target_not_open` with the open ids, never target
 paths. Each slot keeps its own provider process, lifecycle lock, cancellation
 scope, and analysis snapshot; Evidence records remain session-wide and stay
 bound to each target's digest. `close_binary` accepts `target_id`; without one it
 closes the current target.
+
+### Background analysis
+
+`open_binary` accepts `analysis_mode`. `foreground` (default) blocks until the
+provider is ready. `background` starts a server-owned job and returns at once
+with `analysis: {state: "starting", mode: "background", started_at,
+elapsed_ms}`; a cancelled request stops only its own wait, never the job.
+`auto` waits up to `auto_background_after_ms` (default
+`REA_GHIDRA_AUTO_BACKGROUND_AFTER_MS`, 120 000 ms) and then returns the same
+`starting` state while the job continues.
+
+Official analysis tools and `binary_session` accept `wait_ms` (default 180 000,
+maximum 290 000). A call addressed to a still-starting target waits up to that
+budget, then fails with the retryable `analysis_in_progress` code and elapsed
+time. `binary_session` instead reports the current state. `analysis` states are
+`starting`, `ready`, `failed`, and `cancelled`. `close_binary` aborts the job
+through the existing close path; an incomplete close still publishes nothing.
+A job ends with its MCP server process.
 
 `tools/list` returns the complete canonical tool inventory, including tools that
 are currently unavailable. Opening or closing a target or observing a provider

@@ -25,7 +25,18 @@ const official = <Name extends string, Schema extends z.ZodObject>(
   inputSchema: Schema,
 ) => {
   const strictInputSchema = inputSchema
-    .extend({ target_id: targetId.optional() })
+    .extend({
+      target_id: targetId.optional(),
+      wait_ms: z
+        .number()
+        .int()
+        .min(1)
+        .max(290_000)
+        .optional()
+        .describe(
+          "Maximum milliseconds to wait for a starting target before returning analysis_in_progress. Default 180000; maximum 290000.",
+        ),
+    })
     .strict();
   return {
     name,

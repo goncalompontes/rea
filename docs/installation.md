@@ -984,6 +984,10 @@ passes the deadline to each provider client; a startup failure is returned by th
 without exposing partial analysis. This deadline is separate from MCP transport
 initialization and the client's deadline for that individual tool call. A client
 can time out earlier even when Ghidra would complete within its startup deadline.
+If the client deadline is the problem, request `analysis_mode: "background"` (or
+`"auto"`) and poll with `wait_ms`; the server-owned job keeps running after the
+request returns. `REA_GHIDRA_AUTO_BACKGROUND_AFTER_MS` sets the auto threshold
+(default 120,000 ms). A job still ends with its MCP server process.
 See [Ghidra first-query deadlines and recovery](mcp-contracts.md#ghidra-first-query-deadlines-and-recovery)
 for client options and the close/reopen recovery flow.
 

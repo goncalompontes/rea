@@ -732,6 +732,7 @@ export class BinarySession
     signal: AbortSignal | undefined,
     operation: (analysis: AnalysisOperationPort) => Promise<Value>,
     _targetId?: string,
+    _waitMs?: number,
   ): Promise<Result<Value, AnalysisError>> {
     const generation = this.#transitionGeneration;
     const transition = this.#transition;

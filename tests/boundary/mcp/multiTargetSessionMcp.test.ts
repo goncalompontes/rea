@@ -9,6 +9,7 @@ import { createAnalysisExecution } from "../../../src/application/AnalysisProvid
 import { observed } from "../../fixtures/analysisExecution.js";
 import {
   createBinarySessionTargets,
+  createDeferred,
   createTestBinaryTargetRegistry,
 } from "../../fixtures/binarySession.js";
 
@@ -67,8 +68,43 @@ const targetId = (result: { readonly structuredContent?: unknown }): string => {
   return id;
 };
 
-describe("multi-target MCP session", () => {
-  it("opens two targets and routes an analysis call by target_id", async () => {
+const connectBackground = async () => {
+  const [first] = await createBinarySessionTargets();
+  const health = createDeferred<ReturnType<typeof observed>>();
+  const registry = createTestBinaryTargetRegistry((target) => ({
+    execute: (operation) =>
+      operation === "health"
+        ? health.promise
+        : Promise.resolve(
+            resultOk(
+              createAnalysisExecution(operation, FIXTURE_PROVIDER, {
+                subject: target,
+              }),
+            ),
+          ),
+    close: () => Promise.resolve(resultOk(null)),
+  }));
+  const server = createServer(
+    { kind: "session", session: registry },
+    { logger: silentLogger },
+  );
+  const client = new Client({ name: "background-target", version: "1.0.0" });
+  const [clientTransport, serverTransport] =
+    InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  return {
+    client,
+    health,
+    first,
+    close: async () => {
+      await Promise.allSettled([client.close(), server.close()]);
+      await registry.closeAll();
+    },
+  };
+};
+
+describe("multi-target MCP session", () => {  it("opens two targets and routes an analysis call by target_id", async () => {
     const harness = await connect();
     try {
       const openedFirst = await harness.client.callTool({
@@ -144,6 +180,40 @@ describe("multi-target MCP session", () => {
         target_id: secondId,
         open_target_ids: [secondId],
       });
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("opens in background and reports analysis_in_progress inside the wait budget", async () => {
+    const harness = await connectBackground();
+    try {
+      const opened = await harness.client.callTool({
+        name: "open_binary",
+        arguments: {
+          path: harness.first,
+          analysis_mode: "background",
+        },
+      });
+      expect(opened.isError).not.toBe(true);
+      expect((opened.structuredContent as { result?: unknown }).result).toMatchObject({
+        analysis: { state: "starting", mode: "background" },
+      });
+
+      const polled = await harness.client.callTool({
+        name: "address_name",
+        arguments: { address: "0x1000", wait_ms: 10 },
+      });
+      expect(polled.isError).toBe(true);
+      expect(JSON.stringify(polled)).toContain("analysis_in_progress");
+
+      harness.health.resolve(observed(null));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const analyzed = await harness.client.callTool({
+        name: "address_name",
+        arguments: { address: "0x1000" },
+      });
+      expect(analyzed.isError).not.toBe(true);
     } finally {
       await harness.close();
     }

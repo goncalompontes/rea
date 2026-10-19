@@ -185,6 +185,12 @@ const registerOpenLifecycleTool = (
           ...(input.keep_others_open === true
             ? { keepOthersOpen: true }
             : {}),
+          ...(input.analysis_mode === "foreground"
+            ? {}
+            : { analysisMode: input.analysis_mode }),
+          ...(input.auto_background_after_ms === undefined
+            ? {}
+            : { autoBackgroundAfterMs: input.auto_background_after_ms }),
           ...(input.format === undefined ? {} : { formatHint: input.format }),
           ...(input.architecture === undefined
             ? {}
@@ -210,6 +216,7 @@ const registerOpenLifecycleTool = (
         }),
       );
       const targetId = session.currentTargetId?.();
+      const analysis = session.analysisState?.();
       return opened.ok
         ? server.delivery.toCallToolResult(
             {
@@ -217,6 +224,7 @@ const registerOpenLifecycleTool = (
               value: {
                 ...binaryTargetSummary(opened.value),
                 ...(targetId === undefined ? {} : { target_id: targetId }),
+                ...(analysis === undefined ? {} : { analysis }),
               },
             },
             openContract,

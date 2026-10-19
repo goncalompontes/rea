@@ -18,6 +18,7 @@ import {
   AnalysisTimeoutError,
   AnalysisResourceConstraintError,
   AnalysisTargetNotOpenError,
+  AnalysisInProgressError,
 } from "./analysisErrorCore.js";
 import { ArtifactOperationError } from "./artifactOperationError.js";
 import {
@@ -232,6 +233,7 @@ const STATIC_ERROR_CODES = {
   AnalysisTimeoutError: "provider_timeout",
   AnalysisResourceConstraintError: "resource_constraint",
   AnalysisTargetNotOpenError: "target_not_open",
+  AnalysisInProgressError: "analysis_in_progress",
   HopperTimeoutError: "provider_timeout",
   HopperProcessError: "provider_unavailable",
   HopperStartError: "provider_unavailable",
@@ -293,6 +295,13 @@ const requestErrorDetails = (
       operation: error.operation,
       target_id: error.requestedTargetId,
       open_target_ids: [...error.openTargetIds],
+    };
+  if (error instanceof AnalysisInProgressError)
+    return {
+      operation: error.operation,
+      target_id: error.targetId,
+      elapsed_ms: error.elapsedMs,
+      ...(error.progress === undefined ? {} : { progress: error.progress }),
     };
   if (error instanceof AnalysisArtifactChangedError)
     return {
@@ -581,6 +590,7 @@ const RETRYABLE_CODES: ReadonlySet<AnalysisErrorProjection["code"]> = new Set([
   "cancelled",
   "revision_conflict",
   "provider_unavailable",
+  "analysis_in_progress",
 ]);
 
 export interface AnalysisErrorProjection extends Readonly<
@@ -607,6 +617,7 @@ export interface AnalysisErrorProjection extends Readonly<
     | "configuration_invalid"
     | "target_unavailable"
     | "target_not_open"
+    | "analysis_in_progress"
     | "execution_failure";
   readonly category:
     | "invalid_input"
